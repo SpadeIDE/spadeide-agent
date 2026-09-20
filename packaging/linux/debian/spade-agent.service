@@ -1,0 +1,20 @@
+[Unit]
+Description=SpadeIDE Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=spade
+ExecStart=/usr/bin/spadeide serve --foreground --port 7422 --control-port 7423
+Restart=on-failure
+RestartSec=3
+WorkingDirectory=/home/spade
+Environment=HOME=/home/spade
+
+# Disabled by default. For a dedicated server account:
+#   sudo useradd --create-home --shell /bin/bash spade
+#   sudo systemctl enable --now spade-agent
+
+[Install]
+WantedBy=multi-user.target

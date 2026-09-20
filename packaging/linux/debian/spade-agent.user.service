@@ -1,0 +1,14 @@
+[Unit]
+Description=SpadeIDE Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/spadeide serve --foreground --port 7422 --control-port 7423
+Restart=on-failure
+RestartSec=3
+Environment=HOME=%h
+
+[Install]
+WantedBy=default.target

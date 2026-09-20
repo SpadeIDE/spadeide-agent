@@ -1,0 +1,9 @@
+.DS_Store
+/agent/bin/
+/agent/spade-agent
+/dist/
+/github-release/
+**/.spade-agent/
+*.exe
+*.test
+*.out

@@ -1,0 +1,19 @@
+SpadeIDE for Debian / Ubuntu
+============================
+
+One command:
+
+  spadeide              start if needed, show QR + pair URL
+  spadeide status       paired / online tablets
+  spadeide stop
+  spadeide reset        forget paired devices
+
+Several tablets can stay paired. Each bare `spadeide` run issues a fresh
+pair secret for a new iPad.
+
+  sudo apt install ./spadeide_*.deb
+  spadeide
+
+LAN discovery (IP changes): sudo apt install avahi-daemon avahi-utils
+
+Do not run as root.

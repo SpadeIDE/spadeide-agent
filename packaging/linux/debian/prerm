@@ -1,0 +1,15 @@
+#!/bin/sh
+set -e
+
+if command -v systemctl >/dev/null 2>&1; then
+  systemctl --user stop spade-agent >/dev/null 2>&1 || true
+  systemctl --user disable spade-agent >/dev/null 2>&1 || true
+  if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
+    systemctl --user -M "${SUDO_USER}@" stop spade-agent >/dev/null 2>&1 || true
+    systemctl --user -M "${SUDO_USER}@" disable spade-agent >/dev/null 2>&1 || true
+  fi
+  systemctl stop spade-agent >/dev/null 2>&1 || true
+  systemctl disable spade-agent >/dev/null 2>&1 || true
+fi
+
+exit 0

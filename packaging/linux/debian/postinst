@@ -1,0 +1,22 @@
+#!/bin/sh
+set -e
+
+if command -v systemctl >/dev/null 2>&1; then
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
+    systemctl --user -M "${SUDO_USER}@" daemon-reload >/dev/null 2>&1 || true
+    systemctl --user -M "${SUDO_USER}@" enable --now spade-agent >/dev/null 2>&1 || true
+  fi
+fi
+
+cat <<'EOF'
+
+SpadeIDE is installed.
+
+  spadeide          # QR + pair URL (starts the agent if needed)
+  spadeide status
+  spadeide stop
+
+  LAN discovery: sudo apt install avahi-daemon avahi-utils
+
+EOF

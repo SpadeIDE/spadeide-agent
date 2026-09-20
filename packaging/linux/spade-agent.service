@@ -1,0 +1,19 @@
+[Unit]
+Description=SpadeIDE Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=spade
+ExecStart=/usr/local/bin/spadeide serve --foreground --port 7422 --control-port 7423
+Restart=on-failure
+RestartSec=3
+WorkingDirectory=/home/spade
+Environment=HOME=/home/spade
+
+# Pairing and workspace roots live under ~/.spade-agent of this user.
+# Do not run as root — the iPad would get a root shell.
+
+[Install]
+WantedBy=multi-user.target
