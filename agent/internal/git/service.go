@@ -7,15 +7,12 @@
 package git
 
 import (
-	"bytes"
-	"context"
 	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -105,6 +102,9 @@ func repoName(repo, workspace string) string {
 const (
 	MaxRepoDepth = 3
 	MaxRepos     = 40
+	// discoverBudget caps a scan of a huge home directory (Home Assistant,
+	// Docker bind mounts) so git.status cannot run for minutes.
+	discoverBudget = 8 * time.Second
 )
 
 // skipDuringScan are directories that never hold a checkout worth listing.
@@ -114,6 +114,17 @@ var skipDuringScan = map[string]bool{
 	".venv": true, "venv": true, "__pycache__": true, ".gradle": true,
 	"target": true, ".terraform": true, ".terragrunt-cache": true,
 	".cache": true, ".next": true, ".nuxt": true,
+	"Library": true, "Applications": true, "containers": true, "overlay2": true,
+}
+
+// skipScanDir is true for directories we should not walk into while looking
+// for checkouts. Hidden folders (except a `.git` work tree itself) are skipped
+// so a project opened at $HOME does not crawl `.local`, `.config`, `.ssh`.
+func skipScanDir(name string) bool {
+	if skipDuringScan[name] {
+		return true
+	}
+	return strings.HasPrefix(name, ".") && name != ".git"
 }
 
 // discoverRepos finds work trees at or under root. A folder holding `.git` is a
@@ -122,16 +133,17 @@ var skipDuringScan = map[string]bool{
 func discoverRepos(root string) ([]string, bool) {
 	var found []string
 	truncated := false
+	deadline := time.Now().Add(discoverBudget)
 
 	_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
 		if err != nil || !d.IsDir() {
 			return nil
 		}
-		if len(found) >= MaxRepos {
+		if time.Now().After(deadline) || len(found) >= MaxRepos {
 			truncated = true
 			return filepath.SkipAll
 		}
-		if path != root && skipDuringScan[d.Name()] {
+		if path != root && skipScanDir(d.Name()) {
 			return filepath.SkipDir
 		}
 		if depth(root, path) > MaxRepoDepth {
@@ -346,46 +358,6 @@ func (s *Service) ApplyHunk(root, path string, hunkIndex int, mode string) error
 	return wrap(err, stderr)
 }
 
-// hunkPatch cuts one hunk out of a unified diff, keeping the file header so the
-// result is a patch git will accept on its own.
-func hunkPatch(raw string, index int) (string, error) {
-	lines := strings.Split(raw, "\n")
-	start := -1
-	for i, line := range lines {
-		if strings.HasPrefix(line, "@@") {
-			start = i
-			break
-		}
-	}
-	if start < 0 {
-		return "", errors.New("no changes left to apply")
-	}
-	header := strings.Join(lines[:start], "\n")
-
-	var hunks [][]string
-	var current []string
-	for _, line := range lines[start:] {
-		if strings.HasPrefix(line, "@@") && len(current) > 0 {
-			hunks = append(hunks, current)
-			current = nil
-		}
-		current = append(current, line)
-	}
-	if len(current) > 0 {
-		hunks = append(hunks, current)
-	}
-	if index < 0 || index >= len(hunks) {
-		return "", errors.New("that change is no longer there — refresh and try again")
-	}
-
-	body := strings.Join(hunks[index], "\n")
-	patch := header + "\n" + body
-	if !strings.HasSuffix(patch, "\n") {
-		patch += "\n"
-	}
-	return patch, nil
-}
-
 // Branches lists local branches, flagging the one that is checked out.
 func (s *Service) Branches(root string) (*protocol.GitBranchesResult, error) {
 	raw, stderr, err := run(20*time.Second, root, "for-each-ref",
@@ -432,241 +404,4 @@ func (s *Service) Checkout(root, branch string, create bool) error {
 	}
 	_, stderr, err := run(60*time.Second, root, args...)
 	return wrap(err, stderr)
-}
-
-// runInput is `run` with a patch on stdin, for `git apply`.
-func runInput(timeout time.Duration, dir, stdin string, args ...string) (string, string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-
-	cmd := exec.CommandContext(ctx, "git", args...)
-	cmd.Dir = dir
-	cmd.Env = gitEnv()
-	cmd.Stdin = strings.NewReader(stdin)
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	err := cmd.Run()
-	if ctx.Err() != nil {
-		return stdout.String(), stderr.String(), fmt.Errorf("git %s timed out", args[0])
-	}
-	return stdout.String(), stderr.String(), err
-}
-
-// runDiff is `run` for the diff family, where exit status 1 means "there are
-// differences" rather than failure.
-func runDiff(timeout time.Duration, dir string, args ...string) (string, string, error) {
-	stdout, stderr, err := run(timeout, dir, args...)
-	var exit *exec.ExitError
-	if errors.As(err, &exit) && exit.ExitCode() == 1 {
-		return stdout, stderr, nil
-	}
-	return stdout, stderr, err
-}
-
-// parseDiff turns unified diff text into hunks, tracking the line numbers on
-// both sides so the client can render a gutter.
-func parseDiff(raw string, out *protocol.GitDiffResult) {
-	var hunk *protocol.GitDiffHunk
-	oldLine, newLine := 0, 0
-	total := 0
-
-	flush := func() {
-		if hunk != nil {
-			out.Hunks = append(out.Hunks, *hunk)
-			hunk = nil
-		}
-	}
-
-	for _, line := range strings.Split(raw, "\n") {
-		switch {
-		case strings.HasPrefix(line, "Binary files"):
-			out.Binary = true
-			flush()
-			return
-		case strings.HasPrefix(line, "@@"):
-			flush()
-			oldLine, newLine = parseHunkHeader(line)
-			hunk = &protocol.GitDiffHunk{Header: line}
-		case hunk == nil:
-			continue // file headers, index lines, ---/+++
-		case total >= MaxDiffLines:
-			out.Truncated = true
-			flush()
-			return
-		case strings.HasPrefix(line, "+"):
-			hunk.Lines = append(hunk.Lines, protocol.GitDiffLine{
-				Kind: "add", Text: line[1:], New: newLine,
-			})
-			newLine++
-			total++
-		case strings.HasPrefix(line, "-"):
-			hunk.Lines = append(hunk.Lines, protocol.GitDiffLine{
-				Kind: "remove", Text: line[1:], Old: oldLine,
-			})
-			oldLine++
-			total++
-		case strings.HasPrefix(line, " "):
-			hunk.Lines = append(hunk.Lines, protocol.GitDiffLine{
-				Kind: "context", Text: line[1:], Old: oldLine, New: newLine,
-			})
-			oldLine++
-			newLine++
-			total++
-		case line == `\ No newline at end of file`:
-			continue
-		}
-	}
-	flush()
-}
-
-// parseHunkHeader reads the starting line numbers out of `@@ -a,b +c,d @@`.
-func parseHunkHeader(header string) (oldLine, newLine int) {
-	body, _, _ := strings.Cut(strings.TrimPrefix(header, "@@ "), " @@")
-	for _, field := range strings.Fields(body) {
-		start, _, _ := strings.Cut(strings.TrimLeft(field, "-+"), ",")
-		n, err := strconv.Atoi(start)
-		if err != nil {
-			continue
-		}
-		if strings.HasPrefix(field, "-") {
-			oldLine = n
-		} else if strings.HasPrefix(field, "+") {
-			newLine = n
-		}
-	}
-	return oldLine, newLine
-}
-
-// run executes git non-interactively and returns stdout and stderr separately.
-func run(timeout time.Duration, dir string, args ...string) (string, string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-
-	cmd := exec.CommandContext(ctx, "git", args...)
-	cmd.Dir = dir
-	cmd.Env = gitEnv()
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	err := cmd.Run()
-	if ctx.Err() != nil {
-		return stdout.String(), stderr.String(), fmt.Errorf("git %s timed out", args[0])
-	}
-	return stdout.String(), stderr.String(), err
-}
-
-// gitEnv keeps every invocation non-interactive and predictable.
-func gitEnv() []string {
-	return append(os.Environ(),
-		// Never block on a prompt the iPad cannot answer.
-		"GIT_TERMINAL_PROMPT=0",
-		// Don't fight a terminal git for the index lock while polling status.
-		"GIT_OPTIONAL_LOCKS=0",
-		// Stable, parseable messages regardless of the user's locale.
-		"LC_ALL=C",
-	)
-}
-
-// wrap turns git's exit status into the message git actually printed, which is
-// far more use to the user than "exit status 128".
-func wrap(err error, stderr string) error {
-	if err == nil {
-		return nil
-	}
-	msg := strings.TrimSpace(stderr)
-	if msg == "" {
-		return err
-	}
-	if line, _, ok := strings.Cut(msg, "\n"); ok && strings.HasPrefix(msg, "fatal:") {
-		msg = line
-	}
-	return errors.New(msg)
-}
-
-// parseStatus reads `git status --porcelain=v2 --branch -z`.
-//
-// Records are NUL-terminated. A rename (`2`) is followed by a second,
-// separate NUL-terminated field holding the original path, so the reader has
-// to consume the next record rather than just split on NUL.
-func parseStatus(raw string, out *protocol.GitRepoStatus) {
-	records := strings.Split(raw, "\x00")
-	for i := 0; i < len(records); i++ {
-		rec := records[i]
-		if rec == "" {
-			continue
-		}
-		switch {
-		case strings.HasPrefix(rec, "# "):
-			parseHeader(rec, out)
-		case strings.HasPrefix(rec, "1 "):
-			if f, ok := parseEntry(rec, 8); ok {
-				appendFile(out, f)
-			}
-		case strings.HasPrefix(rec, "2 "):
-			if f, ok := parseEntry(rec, 9); ok {
-				if i+1 < len(records) {
-					f.Orig = records[i+1]
-					i++ // the original path is its own record
-				}
-				appendFile(out, f)
-			}
-		case strings.HasPrefix(rec, "u "):
-			if f, ok := parseEntry(rec, 10); ok {
-				appendFile(out, f)
-			}
-		case strings.HasPrefix(rec, "? "):
-			appendFile(out, protocol.GitFile{Rel: rec[2:], Index: ".", Work: "?"})
-		}
-	}
-}
-
-func parseHeader(rec string, out *protocol.GitRepoStatus) {
-	key, value, ok := strings.Cut(strings.TrimPrefix(rec, "# "), " ")
-	if !ok {
-		return
-	}
-	switch key {
-	case "branch.head":
-		if value == "(detached)" {
-			out.Detached = true
-		} else {
-			out.Branch = value
-		}
-	case "branch.upstream":
-		out.Upstream = value
-	case "branch.ab":
-		ahead, behind, ok := strings.Cut(value, " ")
-		if !ok {
-			return
-		}
-		out.Ahead, _ = strconv.Atoi(strings.TrimPrefix(ahead, "+"))
-		out.Behind, _ = strconv.Atoi(strings.TrimPrefix(behind, "-"))
-	}
-}
-
-// parseEntry reads a changed-entry record whose path follows `fields`
-// space-separated columns. XY is always the first column after the type.
-func parseEntry(rec string, fields int) (protocol.GitFile, bool) {
-	parts := strings.SplitN(rec, " ", fields+1)
-	if len(parts) < fields+1 || len(parts[1]) < 2 {
-		return protocol.GitFile{}, false
-	}
-	return protocol.GitFile{
-		Rel:   parts[fields],
-		Index: string(parts[1][0]),
-		Work:  string(parts[1][1]),
-	}, true
-}
-
-func appendFile(out *protocol.GitRepoStatus, f protocol.GitFile) {
-	if len(out.Files) >= MaxFiles {
-		out.Truncated = true
-		return
-	}
-	f.Path = filepath.Join(out.Root, f.Rel)
-	if f.Orig != "" {
-		f.Orig = filepath.Join(out.Root, f.Orig)
-	}
-	out.Files = append(out.Files, f)
 }

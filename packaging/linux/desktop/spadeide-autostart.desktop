@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=SpadeIDE Agent
+Comment=Pair your iPad with this computer
+Exec=spadeide-gui
+TryExec=spadeide-gui
+Icon=spadeide
+Terminal=false
+Categories=Development;Network;
+X-GNOME-Autostart-enabled=true
+X-GNOME-UsesNotifications=true
+StartupWMClass=dev.spadeide.agent

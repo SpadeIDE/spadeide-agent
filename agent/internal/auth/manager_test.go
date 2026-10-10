@@ -46,10 +46,10 @@ func TestExpiredSecretRejected(t *testing.T) {
 		t.Fatal(err)
 	}
 	secret, _ := m.PairSecret()
-	m.mu.Lock()
-	m.pairExpires = time.Now().Add(-time.Second)
-	m.prevSecret = ""
-	m.mu.Unlock()
+	m.pair.mu.Lock()
+	m.pair.pairExpires = time.Now().Add(-time.Second)
+	m.pair.prevSecret = ""
+	m.pair.mu.Unlock()
 	_, err = m.ValidateAndPair(secret, "dev-1", "iPad", "pub-a")
 	if err == nil {
 		t.Fatal("expected expiry error")
@@ -92,11 +92,39 @@ func TestKnownDeviceSameKeyRePairsWithoutSecret(t *testing.T) {
 	if err != nil {
 		t.Fatalf("same key should re-pair without secret: %v", err)
 	}
-	if again.Name != "iPad Pro" || again.DevicePub != "pub-a" {
-		t.Fatalf("expected updated name, same pub: %+v", again)
+	if again.Name != "iPad" || again.DevicePub != "pub-a" {
+		t.Fatalf("idempotent re-pair must keep name (not rename via /pair): %+v", again)
 	}
 	if again.CreatedAt != first.CreatedAt {
 		t.Fatal("createdAt should be preserved")
+	}
+}
+
+func TestIdempotentRePairKeepsUnixBind(t *testing.T) {
+	store, err := config.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, err := NewManager(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secret, _ := m.PairSecret()
+	if _, err := m.ValidateAndPair(secret, "dev-1", "iPad", "pub-a"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetDeviceUnixBind("dev-1", "alice", 501, "passwd-hash"); err != nil {
+		t.Fatal(err)
+	}
+	again, err := m.ValidateAndPair("wrong", "dev-1", "Renamed", "pub-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again.UnixUser != "alice" || again.UnixUID != 501 || again.UnixPasswdID != "passwd-hash" {
+		t.Fatalf("unix bind wiped on re-pair: %+v", again)
+	}
+	if again.Name != "iPad" {
+		t.Fatalf("name=%q", again.Name)
 	}
 }
 

@@ -1,0 +1,981 @@
+#!/usr/bin/env python3
+"""SpadeIDE Agent — tray popover + settings, same idea as the macOS app.
+
+Talks to the loopback control API. Falls back to a regular window when
+AppIndicator is missing. GNOME cannot host a true menu-bar extra; the
+popover is a compact utility window shown from the tray.
+"""
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+import gi
+
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+from gi.repository import Gdk, GdkPixbuf, Gio, GLib, Gtk  # noqa: E402
+
+APP_ID = "dev.spadeide.agent"
+PRODUCT_RV = "wss://rendezvous.spadeide.com"
+AUTOSTART_NAME = "spadeide.desktop"
+SYSTEM_STATE_DIR = Path("/var/lib/spade-agent")
+USER_AUTOSTART = Path.home() / ".config" / "autostart" / AUTOSTART_NAME
+SYSTEM_AUTOSTART = Path("/etc/xdg/autostart") / AUTOSTART_NAME
+DESKTOP_SRC = Path("/usr/share/applications") / AUTOSTART_NAME
+ICON_PATHS = (
+    Path("/usr/share/pixmaps/spadeide.png"),
+    Path("/usr/share/icons/hicolor/256x256/apps/spadeide.png"),
+    Path("/usr/share/icons/hicolor/128x128/apps/spadeide.png"),
+    Path("/usr/share/icons/hicolor/48x48/apps/spadeide.png"),
+)
+PANEL_ICON_PATHS = (
+    Path("/usr/share/pixmaps/spadeide-panel.png"),
+    Path("/usr/share/icons/hicolor/24x24/status/spadeide-panel.png"),
+    Path("/usr/share/icons/hicolor/22x22/status/spadeide-panel.png"),
+    Path("/usr/share/icons/hicolor/48x48/status/spadeide-panel.png"),
+    Path("/usr/share/icons/hicolor/24x24/apps/spadeide-panel.png"),
+    Path("/usr/share/icons/hicolor/22x22/apps/spadeide-panel.png"),
+    Path("/usr/share/icons/hicolor/48x48/apps/spadeide-panel.png"),
+)
+
+
+def agent_dir() -> Path:
+    """Mirror config.DefaultDir(): SPADE_AGENT_HOME → system → ~/.spade-agent."""
+    home = os.environ.get("SPADE_AGENT_HOME", "").strip()
+    if home:
+        return Path(home)
+    if os.environ.get("SPADE_AGENT_MODE", "").strip() == "system":
+        return SYSTEM_STATE_DIR
+    if os.geteuid() == 0 and (SYSTEM_STATE_DIR / "control.token").is_file():
+        return SYSTEM_STATE_DIR
+    return Path.home() / ".spade-agent"
+
+
+AGENT_DIR = agent_dir()
+
+CSS = """
+window, dialog { background-color: #0A0E14; color: #E8EEF6; }
+headerbar { background-color: #121821; color: #E8EEF6; }
+headerbar label { color: #E8EEF6; }
+.spade-muted { color: #8B9AAB; }
+.spade-soft { color: #9AA8B8; }
+.spade-ok { color: #2EA86A; }
+.spade-danger { color: #EF5A52; }
+.spade-card {
+  background-color: #121821;
+  border-radius: 6px;
+  border: 1px solid #2A3544;
+  padding: 8px 10px;
+}
+.spade-hairline { background-color: #2A3544; min-height: 1px; }
+eventbox.spade-qr, .spade-qr {
+  background-color: #FFFFFF;
+  border-radius: 6px;
+  border: 1px solid #2A3544;
+}
+.spade-host-value {
+  font-family: monospace;
+  font-size: 13px;
+  font-weight: 500;
+  background-color: transparent;
+  border: none;
+  box-shadow: none;
+  padding: 0;
+}
+.spade-fp-value {
+  font-family: monospace;
+  font-size: 11px;
+  background-color: transparent;
+  border: none;
+  box-shadow: none;
+  padding: 0;
+}
+button.spade-accent {
+  background-image: none;
+  background-color: #E0A01A;
+  color: #0A0E14;
+  font-weight: 600;
+  border: none;
+  border-radius: 6px;
+  padding: 5px 10px;
+}
+button.spade-accent:hover { background-color: #EEB82E; }
+button.spade-ghost {
+  background-image: none;
+  background-color: #121821;
+  color: #E8EEF6;
+  border: 1px solid #2A3544;
+  border-radius: 6px;
+  padding: 5px 9px;
+}
+button.spade-plain {
+  background-image: none;
+  background-color: transparent;
+  color: #8B9AAB;
+  border: none;
+  box-shadow: none;
+  padding: 4px 8px;
+}
+button.spade-plain:hover { color: #E8EEF6; }
+button.spade-icon {
+  background-image: none;
+  background-color: #121821;
+  color: #8B9AAB;
+  border: 1px solid #2A3544;
+  border-radius: 6px;
+  padding: 2px 8px;
+  min-width: 26px;
+}
+entry {
+  background-image: none;
+  background-color: #0A0E14;
+  color: #E8EEF6;
+  border: 1px solid #2A3544;
+  border-radius: 6px;
+  padding: 6px 8px;
+  caret-color: #E8EEF6;
+}
+entry:focus { border-color: #E0A01A; }
+"""
+
+
+def _control_port() -> int:
+    path = AGENT_DIR / "control.port"
+    try:
+        n = int(path.read_text().strip())
+        if n > 0:
+            return n
+    except (OSError, ValueError):
+        pass
+    return 7423
+
+
+def _token() -> str:
+    env = os.environ.get("SPADE_CONTROL_TOKEN", "").strip()
+    if env:
+        return env
+    try:
+        return (AGENT_DIR / "control.token").read_text().strip()
+    except OSError:
+        return ""
+
+
+def api(method: str, path: str, body: dict | None = None):
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{_control_port()}{path}",
+        method=method,
+    )
+    tok = _token()
+    if tok:
+        req.add_header("Authorization", f"Bearer {tok}")
+    data = None
+    if body is not None:
+        data = json.dumps(body).encode()
+        req.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(req, data=data, timeout=3) as res:
+            payload = res.read()
+            ctype = res.headers.get("Content-Type", "")
+            if "json" in ctype:
+                return json.loads(payload.decode() or "{}")
+            return payload
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f"{e.code} {e.reason}") from e
+    except OSError as e:
+        raise RuntimeError("agent is not running") from e
+
+
+def load_png(data: bytes, size: int | None = None) -> GdkPixbuf.Pixbuf | None:
+    try:
+        loader = GdkPixbuf.PixbufLoader.new_with_type("png")
+        loader.write(data)
+        loader.close()
+        pix = loader.get_pixbuf()
+        if pix and size:
+            return pix.scale_simple(size, size, GdkPixbuf.InterpType.BILINEAR)
+        return pix
+    except GLib.Error:
+        return None
+
+
+def _white_pixbuf(size: int) -> GdkPixbuf.Pixbuf:
+    pix = GdkPixbuf.Pixbuf.new(GdkPixbuf.Colorspace.RGB, False, 8, size, size)
+    pix.fill(0xFFFFFFFF)
+    return pix
+
+
+def qr_pixbuf(url: str, size: int = 148) -> GdkPixbuf.Pixbuf | None:
+    try:
+        raw = api("GET", "/v1/pair/qr.png")
+        if isinstance(raw, bytes):
+            pix = load_png(raw, size)
+            if pix:
+                return pix
+    except RuntimeError:
+        pass
+    if not url:
+        return None
+    try:
+        import qrcode
+        from io import BytesIO
+
+        qr = qrcode.QRCode(
+            error_correction=qrcode.constants.ERROR_CORRECT_L,
+            box_size=10,
+            border=2,
+        )
+        qr.add_data(url)
+        qr.make(fit=True)
+        img = qr.make_image(fill_color="black", back_color="white")
+        buf = BytesIO()
+        img.save(buf, format="PNG")
+        return load_png(buf.getvalue(), size)
+    except Exception:
+        return None
+
+
+def which_spadeide() -> str:
+    return shutil.which("spadeide") or "/usr/bin/spadeide"
+
+
+def start_agent() -> None:
+    r = subprocess.run(
+        ["systemctl", "--user", "start", "spade-agent"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    if r.returncode == 0:
+        return
+    subprocess.Popen(
+        [which_spadeide(), "serve"],
+        start_new_session=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def stop_agent() -> None:
+    subprocess.run(
+        ["systemctl", "--user", "stop", "spade-agent"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    subprocess.run(
+        [which_spadeide(), "stop"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def autostart_enabled() -> bool:
+    if USER_AUTOSTART.exists():
+        text = USER_AUTOSTART.read_text(errors="ignore")
+        for line in text.splitlines():
+            if line.strip().lower() == "hidden=true":
+                return False
+        return True
+    return SYSTEM_AUTOSTART.exists()
+
+
+def set_autostart(enabled: bool) -> None:
+    USER_AUTOSTART.parent.mkdir(parents=True, exist_ok=True)
+    src = DESKTOP_SRC if DESKTOP_SRC.exists() else SYSTEM_AUTOSTART
+    if src.exists():
+        text = src.read_text()
+    else:
+        text = (
+            "[Desktop Entry]\n"
+            "Type=Application\n"
+            "Name=SpadeIDE Agent\n"
+            "Exec=spadeide-gui\n"
+            "Icon=spadeide\n"
+            "Terminal=false\n"
+        )
+    lines = [ln for ln in text.splitlines() if not ln.lower().startswith("hidden=")]
+    if not enabled:
+        lines.append("Hidden=true")
+    USER_AUTOSTART.write_text("\n".join(lines) + "\n")
+
+
+def _try_appindicator():
+    for ns in ("AyatanaAppIndicator3", "AppIndicator3"):
+        try:
+            gi.require_version(ns, "0.1")
+            return getattr(__import__("gi.repository", fromlist=[ns]), ns)
+        except (ValueError, ImportError, AttributeError):
+            continue
+    return None
+
+
+def icon_file() -> str | None:
+    for p in ICON_PATHS:
+        if p.is_file():
+            return str(p)
+    return None
+
+
+def panel_icon_file() -> str | None:
+    for p in PANEL_ICON_PATHS:
+        if p.is_file():
+            return str(p)
+    return icon_file()
+
+
+def apply_window_icon(win: Gtk.Window) -> None:
+    path = icon_file()
+    if not path:
+        Gtk.Window.set_default_icon_name("spadeide")
+        win.set_icon_name("spadeide")
+        return
+    try:
+        Gtk.Window.set_default_icon_from_file(path)
+        win.set_icon_from_file(path)
+    except GLib.Error:
+        win.set_icon_name("spadeide")
+
+
+def section_label(title: str) -> Gtk.Label:
+    lab = Gtk.Label(xalign=0)
+    lab.set_markup(
+        f'<span size="9000" weight="semibold" letter_spacing="800">{title.upper()}</span>'
+    )
+    lab.get_style_context().add_class("spade-muted")
+    return lab
+
+
+def hairline() -> Gtk.Widget:
+    line = Gtk.EventBox()
+    line.set_size_request(-1, 1)
+    line.get_style_context().add_class("spade-hairline")
+    return line
+
+
+def _plain_button(label: str, cb) -> Gtk.Button:
+    b = Gtk.Button(label=label)
+    b.get_style_context().add_class("spade-plain")
+    b.connect("clicked", cb)
+    return b
+
+
+class AgentWindow(Gtk.ApplicationWindow):
+    """Compact tray popover — Host, remote toggle, devices, QR, footer."""
+
+    def __init__(self, app: "AgentApplication"):
+        super().__init__(application=app, title="SpadeIDE Agent")
+        self.app = app
+        self._qr_stamp = ""
+        self._qr_ok = False
+        self._busy = False
+        self._running = False
+
+        self.set_default_size(360, 1)
+        self.set_resizable(False)
+        apply_window_icon(self)
+        self.set_type_hint(Gdk.WindowTypeHint.UTILITY)
+        if app.indicator:
+            self.set_skip_taskbar_hint(True)
+            self.set_skip_pager_hint(True)
+            self.set_keep_above(True)
+        self.connect("delete-event", self._on_delete)
+        self.connect("show", lambda *_: GLib.idle_add(self._place_near_panel))
+
+        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+
+        header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        header.set_margin_start(14)
+        header.set_margin_end(10)
+        header.set_margin_top(10)
+        header.set_margin_bottom(8)
+        titles = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1)
+        name = Gtk.Label(label="SpadeIDE Agent", xalign=0)
+        name.set_markup('<span size="13000" weight="semibold">SpadeIDE Agent</span>')
+        titles.add(name)
+        cap_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        self._subtitle = Gtk.Label(xalign=0)
+        cap_row.add(self._subtitle)
+        titles.add(cap_row)
+        header.pack_start(titles, True, True, 0)
+        self._version = Gtk.Label()
+        self._version.get_style_context().add_class("spade-muted")
+        header.pack_end(self._version, False, False, 0)
+        root.add(header)
+        root.add(hairline())
+
+        body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        body.set_margin_top(10)
+        body.set_margin_bottom(10)
+        body.set_margin_start(14)
+        body.set_margin_end(14)
+
+        self._host = Gtk.Label(xalign=0)
+        self._host.set_selectable(False)
+        self._host.set_can_focus(False)
+        self._host.get_style_context().add_class("spade-host-value")
+        self._fp = Gtk.Label(xalign=0)
+        self._fp.set_selectable(False)
+        self._fp.set_can_focus(False)
+        self._fp.get_style_context().add_class("spade-muted")
+        self._fp.get_style_context().add_class("spade-fp-value")
+        host_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
+        host_box.add(section_label("Host"))
+        host_line = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        host_line.add(self._host)
+        host_line.add(self._fp)
+        host_box.add(host_line)
+        body.add(host_box)
+
+        remote_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        remote_row.get_style_context().add_class("spade-card")
+        remote_info = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1)
+        remote_title = Gtk.Label(label="Remote access", xalign=0)
+        remote_sub = Gtk.Label(label="Off the local network", xalign=0)
+        remote_sub.get_style_context().add_class("spade-muted")
+        remote_info.pack_start(remote_title, False, False, 0)
+        remote_info.pack_start(remote_sub, False, False, 0)
+        self._remote = Gtk.Switch()
+        self._remote.set_valign(Gtk.Align.CENTER)
+        self._remote.connect("notify::active", self._on_remote)
+        remote_row.pack_start(remote_info, True, True, 0)
+        remote_row.pack_end(self._remote, False, False, 0)
+        body.add(remote_row)
+
+        self._devices = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        dev_wrap = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
+        head = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        head.add(section_label("Devices"))
+        self._reset_btn = Gtk.Button(label="Remove all")
+        self._reset_btn.get_style_context().add_class("spade-plain")
+        self._reset_btn.connect("clicked", self._on_reset)
+        head.pack_end(self._reset_btn, False, False, 0)
+        dev_wrap.add(head)
+        dev_scroll = Gtk.ScrolledWindow()
+        dev_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        dev_scroll.set_max_content_height(132)
+        dev_scroll.set_propagate_natural_height(True)
+        dev_scroll.add(self._devices)
+        dev_wrap.add(dev_scroll)
+        body.add(dev_wrap)
+
+        pair = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        pair.add(section_label("Pair iPad"))
+        pair_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=14)
+        self._qr_box = Gtk.EventBox()
+        self._qr_box.set_visible_window(True)
+        self._qr_box.set_size_request(148, 148)
+        self._qr_box.set_valign(Gtk.Align.START)
+        self._qr_box.get_style_context().add_class("spade-qr")
+        self._qr = Gtk.Image()
+        self._qr.set_size_request(148, 148)
+        self._qr.set_from_pixbuf(_white_pixbuf(148))
+        self._qr_box.add(self._qr)
+        pair_row.pack_start(self._qr_box, False, False, 0)
+        pair_actions = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        hint = Gtk.Label(
+            label="Scan with SpadeIDE, or copy the pair URL.",
+            xalign=0,
+            wrap=True,
+        )
+        hint.get_style_context().add_class("spade-muted")
+        pair_actions.add(hint)
+        self._copy = Gtk.Button(label="Copy pair URL")
+        self._copy.get_style_context().add_class("spade-accent")
+        self._copy.connect("clicked", self._on_copy)
+        pair_actions.add(self._copy)
+        self._rotate = Gtk.Button(label="New pair code")
+        self._rotate.get_style_context().add_class("spade-ghost")
+        self._rotate.connect("clicked", self._on_rotate)
+        pair_actions.add(self._rotate)
+        pair_row.pack_start(pair_actions, True, True, 0)
+        pair.add(pair_row)
+        body.add(pair)
+
+        self._error = Gtk.Label(xalign=0, wrap=True)
+        self._error.get_style_context().add_class("spade-danger")
+        body.add(self._error)
+        root.add(body)
+        root.add(hairline())
+
+        actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        actions.set_margin_start(10)
+        actions.set_margin_end(10)
+        actions.set_margin_top(6)
+        actions.set_margin_bottom(8)
+        self._btn_start = Gtk.Button(label="Start")
+        self._btn_start.get_style_context().add_class("spade-accent")
+        self._btn_start.connect("clicked", self._on_start)
+        self._btn_stop = Gtk.Button(label="Stop")
+        self._btn_stop.get_style_context().add_class("spade-ghost")
+        self._btn_stop.connect("clicked", self._on_stop)
+        self._btn_restart = Gtk.Button(label="Restart")
+        self._btn_restart.get_style_context().add_class("spade-ghost")
+        self._btn_restart.connect("clicked", self._on_restart)
+        actions.add(self._btn_start)
+        actions.add(self._btn_stop)
+        actions.add(self._btn_restart)
+        actions.add(_plain_button("Config", self._on_config))
+        actions.add(_plain_button("Logs", self._on_logs))
+        spacer = Gtk.Box()
+        actions.pack_start(spacer, True, True, 0)
+        settings_b = Gtk.Button(label="Settings")
+        settings_b.get_style_context().add_class("spade-icon")
+        settings_b.connect("clicked", lambda *_: self.app.show_settings())
+        actions.add(settings_b)
+        quit_b = _plain_button("Quit", lambda *_: self.app.quit())
+        quit_b.get_style_context().add_class("spade-danger")
+        actions.add(quit_b)
+        root.add(actions)
+
+        self.add(root)
+        self.show_all()
+        self._sync_run_buttons()
+        GLib.timeout_add(400, self._boot)
+        GLib.timeout_add_seconds(2, self._tick)
+
+    def _place_near_panel(self):
+        try:
+            gdk_win = self.get_window()
+            display = self.get_display()
+            monitor = None
+            if gdk_win:
+                monitor = display.get_monitor_at_window(gdk_win)
+            if monitor is None:
+                monitor = display.get_primary_monitor()
+            if monitor is None:
+                return False
+            geo = monitor.get_geometry()
+            w = self.get_allocated_width() or 360
+            self.move(geo.x + geo.width - w - 16, geo.y + 32)
+        except Exception:
+            pass
+        return False
+
+    def _on_delete(self, *_args):
+        if self.app.indicator:
+            self.hide()
+            return True
+        return False
+
+    def _boot(self):
+        try:
+            api("GET", "/v1/status")
+        except RuntimeError:
+            start_agent()
+        self.refresh()
+        return False
+
+    def _tick(self):
+        if not self._busy:
+            self.refresh()
+            if self.app.settings_win and self.app.settings_win.get_visible():
+                self.app.settings_win.refresh()
+        return True
+
+    def refresh(self):
+        try:
+            st = api("GET", "/v1/status")
+        except RuntimeError as e:
+            self._running = False
+            self._subtitle.set_markup('<span color="#8B9AAB" size="11000" weight="medium">Stopped</span>')
+            self._host.set_text("Start the agent to pair an iPad.")
+            self._fp.set_text("")
+            self._error.set_text(str(e) if "not running" not in str(e) else "")
+            self._qr_stamp = ""
+            self._show_qr("")
+            self._sync_run_buttons()
+            self.app.set_running(False)
+            return
+        self._running = True
+        self._error.set_text("")
+        n = len(st.get("clients") or [])
+        if n == 1:
+            cap = "Running · 1 client"
+        elif n > 1:
+            cap = f"Running · {n} clients"
+        else:
+            cap = "Running"
+        self._subtitle.set_markup(
+            f'<span color="#2EA86A" size="11000" weight="medium">{cap}</span>'
+        )
+        self._version.set_markup(
+            f'<span size="10000" font_family="monospace">{st.get("version") or ""}</span>'
+        )
+        ip, port = st.get("ip") or "127.0.0.1", st.get("port") or 7422
+        self._host.set_text(f"{ip}:{int(port)}")
+        fp = st.get("fingerprint") or ""
+        short = fp[:12] + "…" if len(fp) > 12 else fp
+        self._fp.set_text(short)
+        self._remote.handler_block_by_func(self._on_remote)
+        self._remote.set_active(bool(st.get("remoteAccess")))
+        self._remote.handler_unblock_by_func(self._on_remote)
+        self._render_devices(st.get("devices") or [])
+        stamp = st.get("pairURL") or ""
+        if stamp != self._qr_stamp or (stamp and not self._qr_ok):
+            self._qr_stamp = stamp
+            self._show_qr(stamp)
+        self._sync_run_buttons()
+        self.app.set_running(True)
+
+    def _sync_run_buttons(self):
+        self._btn_start.set_visible(not self._running)
+        self._btn_stop.set_visible(self._running)
+        self._btn_restart.set_visible(self._running)
+
+    def _show_qr(self, url: str):
+        if not url:
+            self._qr.set_from_pixbuf(_white_pixbuf(148))
+            self._qr_ok = False
+            return
+        pix = qr_pixbuf(url, 148)
+        if pix is None:
+            self._qr.set_from_pixbuf(_white_pixbuf(148))
+            self._qr_ok = False
+            return
+        self._qr.set_from_pixbuf(pix)
+        self._qr_ok = True
+
+    def _render_devices(self, devices: list):
+        for child in list(self._devices.get_children()):
+            self._devices.remove(child)
+        if not devices:
+            empty = Gtk.Label(label="No paired iPads yet.", xalign=0)
+            empty.get_style_context().add_class("spade-muted")
+            self._devices.add(empty)
+        else:
+            for d in devices:
+                row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+                row.get_style_context().add_class("spade-card")
+                dot = Gtk.Label(label="●" if d.get("online") else "○")
+                name = Gtk.Label(label=d.get("name") or "iPad", xalign=0)
+                ident = Gtk.Label(label=(d.get("id") or "")[:8], xalign=0)
+                ident.get_style_context().add_class("spade-muted")
+                btn = Gtk.Button(label="×")
+                btn.get_style_context().add_class("spade-plain")
+                btn.connect("clicked", lambda _b, i=d.get("id"): self._unpair(i))
+                row.pack_start(dot, False, False, 0)
+                row.pack_start(name, True, True, 0)
+                row.pack_start(ident, False, False, 0)
+                row.pack_end(btn, False, False, 0)
+                self._devices.add(row)
+        self._devices.show_all()
+
+    def _on_remote(self, switch, *_):
+        try:
+            api("POST", "/v1/remote", {"enabled": bool(switch.get_active())})
+        except RuntimeError as e:
+            self._error.set_text(str(e))
+        self.refresh()
+
+    def _on_copy(self, *_):
+        try:
+            st = api("GET", "/v1/status")
+        except RuntimeError as e:
+            self._error.set_text(str(e))
+            return
+        url = st.get("pairURL") or ""
+        Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD).set_text(url, -1)
+        self._copy.set_label("Copied")
+        GLib.timeout_add_seconds(2, lambda: self._copy.set_label("Copy pair URL") or False)
+
+    def _on_rotate(self, *_):
+        try:
+            api("POST", "/v1/pair/rotate")
+        except RuntimeError as e:
+            self._error.set_text(str(e))
+        self._qr_stamp = ""
+        self.refresh()
+
+    def _on_reset(self, *_):
+        dlg = Gtk.MessageDialog(
+            transient_for=self,
+            modal=True,
+            message_type=Gtk.MessageType.WARNING,
+            buttons=Gtk.ButtonsType.OK_CANCEL,
+            text="Remove all paired devices?",
+        )
+        dlg.format_secondary_text("iPads will need to scan the QR again.")
+        resp = dlg.run()
+        dlg.destroy()
+        if resp != Gtk.ResponseType.OK:
+            return
+        try:
+            api("POST", "/v1/pair/reset")
+        except RuntimeError as e:
+            self._error.set_text(str(e))
+        self.refresh()
+
+    def _unpair(self, device_id: str):
+        if not device_id:
+            return
+        try:
+            api("DELETE", f"/v1/pair/devices/{device_id}")
+        except RuntimeError as e:
+            self._error.set_text(str(e))
+        self.refresh()
+
+    def _on_start(self, *_):
+        start_agent()
+        GLib.timeout_add(600, lambda: self.refresh() or False)
+
+    def _on_stop(self, *_):
+        stop_agent()
+        self.refresh()
+
+    def _on_restart(self, *_):
+        stop_agent()
+
+        def go():
+            start_agent()
+            self.refresh()
+            return False
+
+        GLib.timeout_add(400, go)
+
+    def _on_config(self, *_):
+        AGENT_DIR.mkdir(parents=True, exist_ok=True)
+        subprocess.Popen(["xdg-open", str(AGENT_DIR)])
+
+    def _on_logs(self, *_):
+        log = AGENT_DIR / "agent.log"
+        log.parent.mkdir(parents=True, exist_ok=True)
+        log.touch(exist_ok=True)
+        subprocess.Popen(["xdg-open", str(log)])
+
+
+class SettingsWindow(Gtk.Window):
+    def __init__(self, app: "AgentApplication"):
+        super().__init__(title="SpadeIDE Agent Settings")
+        self.app = app
+        self.set_default_size(480, 1)
+        self.set_resizable(False)
+        apply_window_icon(self)
+        self.set_type_hint(Gdk.WindowTypeHint.DIALOG)
+        header = Gtk.HeaderBar()
+        header.set_show_close_button(True)
+        header.set_title("Settings")
+        self.set_titlebar(header)
+        self.connect("delete-event", self._on_delete)
+
+        body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
+        body.set_margin_top(20)
+        body.set_margin_bottom(22)
+        body.set_margin_start(22)
+        body.set_margin_end(22)
+
+        body.add(section_label("Remote"))
+        rv_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        rv_box.get_style_context().add_class("spade-card")
+        rv_title = Gtk.Label(label="Rendezvous URL", xalign=0)
+        rv_sub = Gtk.Label(
+            label="Introducer for off-LAN connect. Same URL as on the iPad. Leave empty for the product host.",
+            xalign=0,
+            wrap=True,
+        )
+        rv_sub.get_style_context().add_class("spade-muted")
+        rv_box.add(rv_title)
+        rv_box.add(rv_sub)
+        self._rv = Gtk.Entry()
+        self._rv.set_placeholder_text(PRODUCT_RV)
+        self._rv.connect("activate", self._on_rv_apply)
+        rv_box.add(self._rv)
+        rv_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self._rv_save = Gtk.Button(label="Apply")
+        self._rv_save.get_style_context().add_class("spade-ghost")
+        self._rv_save.connect("clicked", self._on_rv_apply)
+        rv_row.add(self._rv_save)
+        self._rv_status = Gtk.Label(xalign=0, wrap=True)
+        self._rv_status.get_style_context().add_class("spade-muted")
+        rv_row.pack_start(self._rv_status, True, True, 0)
+        rv_box.add(rv_row)
+        body.add(rv_box)
+
+        body.add(section_label("Startup"))
+        login_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        login_row.get_style_context().add_class("spade-card")
+        login_info = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1)
+        login_title = Gtk.Label(label="Launch at login", xalign=0)
+        login_sub = Gtk.Label(label="Show the tray when you sign in.", xalign=0)
+        login_sub.get_style_context().add_class("spade-muted")
+        login_info.pack_start(login_title, False, False, 0)
+        login_info.pack_start(login_sub, False, False, 0)
+        self._login = Gtk.Switch()
+        self._login.set_valign(Gtk.Align.CENTER)
+        self._login.set_active(autostart_enabled())
+        self._login.connect("notify::active", self._on_login)
+        login_row.pack_start(login_info, True, True, 0)
+        login_row.pack_end(self._login, False, False, 0)
+        body.add(login_row)
+
+        body.add(section_label("About"))
+        about = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        about.get_style_context().add_class("spade-card")
+        self._about_ver = Gtk.Label(xalign=0)
+        about.add(self._about_ver)
+        body.add(about)
+
+        self._error = Gtk.Label(xalign=0, wrap=True)
+        self._error.get_style_context().add_class("spade-danger")
+        body.add(self._error)
+
+        self.add(body)
+        self.show_all()
+        self.refresh()
+
+    def _on_delete(self, *_args):
+        self.hide()
+        return True
+
+    def refresh(self):
+        try:
+            st = api("GET", "/v1/status")
+        except RuntimeError:
+            self._about_ver.set_text("Version  —")
+            self._rv_status.set_text("Agent is not running.")
+            return
+        self._about_ver.set_text(f"Version    {st.get('version') or '—'}")
+        if not self._rv.has_focus():
+            srv = (st.get("remoteServer") or "").strip()
+            if srv == PRODUCT_RV:
+                srv = ""
+            if self._rv.get_text() != srv:
+                self._rv.set_text(srv)
+        if not st.get("remoteAccess"):
+            self._rv_status.set_text("Turn on Remote access in the tray to use this off the LAN.")
+        elif st.get("remoteRegistered"):
+            self._rv_status.set_text("Registered on rendezvous.")
+        else:
+            self._rv_status.set_text("Not registered — check the URL and network.")
+
+    def _on_rv_apply(self, *_):
+        url = (self._rv.get_text() or "").strip()
+        try:
+            api("POST", "/v1/remote", {"server": url})
+            self._error.set_text("")
+        except RuntimeError as e:
+            self._error.set_text(str(e))
+        self.refresh()
+
+    def _on_login(self, switch, *_):
+        set_autostart(bool(switch.get_active()))
+
+
+class AgentApplication(Gtk.Application):
+    def __init__(self):
+        super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.FLAGS_NONE)
+        self.win: AgentWindow | None = None
+        self.settings_win: SettingsWindow | None = None
+        self.indicator = None
+
+    def do_startup(self):
+        Gtk.Application.do_startup(self)
+        GLib.set_prgname("spadeide")
+        GLib.set_application_name("SpadeIDE Agent")
+        screen = Gdk.Screen.get_default()
+        css = Gtk.CssProvider()
+        css.load_from_data(CSS.encode())
+        Gtk.StyleContext.add_provider_for_screen(
+            screen, css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+        )
+        settings = Gtk.Settings.get_default()
+        if settings:
+            settings.set_property("gtk-application-prefer-dark-theme", True)
+        self._setup_tray()
+        if self.indicator:
+            self.hold()
+
+    def do_activate(self):
+        if self.win is None:
+            self.win = AgentWindow(self)
+        self.toggle_popover(force_show=True)
+
+    def toggle_popover(self, force_show: bool = False):
+        if self.win is None:
+            self.win = AgentWindow(self)
+        if self.win.get_visible() and not force_show:
+            self.win.hide()
+            return
+        self.win.show_all()
+        self.win._sync_run_buttons()
+        self.win.present()
+        GLib.idle_add(self.win._place_near_panel)
+
+    def show_settings(self):
+        if self.settings_win is None:
+            self.settings_win = SettingsWindow(self)
+        self.settings_win.show_all()
+        self.settings_win.present()
+        self.settings_win.refresh()
+
+    def set_running(self, _running: bool):
+        return
+
+    def _setup_tray(self):
+        mod = _try_appindicator()
+        if mod is None:
+            return
+        self._AppInd = mod
+        try:
+            icon_path = panel_icon_file()
+            ind = mod.Indicator.new(
+                APP_ID,
+                "spadeide-panel",
+                mod.IndicatorCategory.APPLICATION_STATUS,
+            )
+            for theme_dir in (
+                "/usr/share/pixmaps",
+                "/usr/share/icons/hicolor/24x24/status",
+                "/usr/share/icons/hicolor/24x24/apps",
+            ):
+                if Path(theme_dir).is_dir():
+                    try:
+                        ind.set_icon_theme_path(theme_dir)
+                        break
+                    except Exception:
+                        pass
+            if icon_path:
+                try:
+                    ind.set_icon_full(icon_path, "SpadeIDE Agent")
+                except Exception:
+                    ind.set_icon("spadeide-panel")
+            else:
+                ind.set_icon("spadeide-panel")
+            ind.set_status(mod.IndicatorStatus.ACTIVE)
+            ind.set_title("SpadeIDE Agent")
+            menu = Gtk.Menu()
+            open_item = Gtk.MenuItem(label="Open")
+            open_item.connect("activate", lambda *_: self.toggle_popover(force_show=True))
+            menu.append(open_item)
+            settings_item = Gtk.MenuItem(label="Settings")
+            settings_item.connect("activate", lambda *_: self.show_settings())
+            menu.append(settings_item)
+            quit_item = Gtk.MenuItem(label="Quit")
+            quit_item.connect("activate", lambda *_: self.quit())
+            menu.append(quit_item)
+            menu.show_all()
+            ind.set_menu(menu)
+            try:
+                if hasattr(ind, "set_item_is_menu"):
+                    ind.set_item_is_menu(False)
+            except Exception:
+                pass
+            try:
+                ind.set_secondary_activate_target(open_item)
+            except Exception:
+                pass
+            self.indicator = ind
+        except Exception:
+            self.indicator = None
+
+
+def main() -> int:
+    return AgentApplication().run(sys.argv)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

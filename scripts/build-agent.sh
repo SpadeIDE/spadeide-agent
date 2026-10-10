@@ -53,8 +53,8 @@ ext=""
 
 mkdir -p "$OUT_DIR"
 if [[ "$goos" == "linux" ]]; then
-  # Public Linux binary name is spadeide (one command for start + pair QR).
-  out_named="$OUT_DIR/spadeide-${goos}-${goarch}${ext}"
+  # Artifact name includes agent; installed CLI remains `spadeide`.
+  out_named="$OUT_DIR/spadeide-agent-${goos}-${goarch}${ext}"
 else
   out_named="$OUT_DIR/spade-agent-${goos}-${goarch}${ext}"
 fi

@@ -4,11 +4,11 @@ import "testing"
 
 func TestSanitizeHost(t *testing.T) {
 	cases := map[string]string{
-		"":                "spade-agent", // may become hostname — only check non-empty path below
-		"my-host":         "my-host",
-		"My Host 01":      "My Host 01",
-		"bad/name*here":   "bad-name-here",
-		"  spaced  ":      "spaced",
+		"":              "spade-agent", // may become hostname — only check non-empty path below
+		"my-host":       "my-host",
+		"My Host 01":    "My Host 01",
+		"bad/name*here": "bad-name-here",
+		"  spaced  ":    "spaced",
 	}
 	for in, want := range cases {
 		if in == "" {

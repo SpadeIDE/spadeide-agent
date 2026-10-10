@@ -22,40 +22,13 @@ import (
 func (s *Server) authenticateControl(control io.ReadWriter, peerCerts []*x509.Certificate) (*config.Device, int, error) {
 	peerN := len(peerCerts)
 
-	chalEnv, err := readFrame(control)
+	chalEnv, err := readFrameLimit(control, MaxAuthFrameBytes)
 	if err != nil {
 		return nil, peerN, fmt.Errorf("read challenge request: %w", err)
 	}
-	if chalEnv.Method != MethodAuthChallenge && chalEnv.Method != MethodAuth {
+	if chalEnv.Method != MethodAuthChallenge {
 		_ = writeFrame(control, protocol.NewError(chalEnv.ID, protocol.CodeUnauthorized, "expected auth.challenge"))
 		return nil, peerN, fmt.Errorf("expected auth.challenge, got %q", chalEnv.Method)
-	}
-
-	// Legacy: client sent a full auth proof in the first message (pre-nonce).
-	// Reject — nonce is required for the proof path; cert-only can short-circuit.
-	if chalEnv.Method == MethodAuth {
-		var ap authParams
-		_ = json.Unmarshal(chalEnv.Params, &ap)
-		if ap.Sig != "" && ap.Nonce == "" {
-			_ = writeFrame(control, protocol.NewError(chalEnv.ID, protocol.CodeUnauthorized, "auth nonce required"))
-			return nil, peerN, fmt.Errorf("auth without nonce")
-		}
-		if ap.Nonce != "" || ap.Sig != "" {
-			dev, err := s.Auth.AuthenticateSession(peerCerts, auth.AuthProof{
-				DeviceID: ap.DeviceID,
-				TS:       ap.TS,
-				Nonce:    ap.Nonce,
-				SigB64:   ap.Sig,
-			})
-			if err != nil {
-				_ = writeFrame(control, protocol.NewError(chalEnv.ID, protocol.CodeUnauthorized, "unauthorized"))
-				return nil, peerN, err
-			}
-			ok := true
-			_ = writeFrame(control, protocol.Envelope{ID: chalEnv.ID, OK: &ok, Result: json.RawMessage(`{}`)})
-			return dev, peerN, nil
-		}
-		// Bare auth with only deviceId / empty → treat as challenge request.
 	}
 
 	nonce := s.Auth.IssueAuthNonce()
@@ -65,7 +38,7 @@ func (s *Server) authenticateControl(control io.ReadWriter, peerCerts []*x509.Ce
 		return nil, peerN, err
 	}
 
-	authEnv, err := readFrame(control)
+	authEnv, err := readFrameLimit(control, MaxAuthFrameBytes)
 	if err != nil {
 		return nil, peerN, fmt.Errorf("read auth: %w", err)
 	}

@@ -105,6 +105,28 @@ func EnrichEnv(base []string, cols, rows int) []string {
 	return out
 }
 
+// OverrideEnv copies base, then applies set. Empty values delete the key.
+func OverrideEnv(base []string, set map[string]string) []string {
+	env := map[string]string{}
+	for _, e := range base {
+		if i := strings.IndexByte(e, '='); i > 0 {
+			env[e[:i]] = e[i+1:]
+		}
+	}
+	for k, v := range set {
+		if v == "" {
+			delete(env, k)
+		} else {
+			env[k] = v
+		}
+	}
+	out := make([]string, 0, len(env))
+	for k, v := range env {
+		out = append(out, k+"="+v)
+	}
+	return out
+}
+
 // StartPTY starts cmd attached to a PTY and returns the master file.
 func StartPTY(cmd *exec.Cmd) (*os.File, error) {
 	return startPTY(cmd)

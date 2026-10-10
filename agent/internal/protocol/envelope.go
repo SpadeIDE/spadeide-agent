@@ -32,6 +32,7 @@ const (
 const (
 	MethodHello            = "hello"
 	MethodPing             = "ping"
+	MethodHostLogin        = "host.login"
 	MethodWorkspaceRoots   = "workspace.roots"
 	MethodWorkspaceOpen    = "workspace.open"
 	MethodFSList           = "fs.list"
@@ -65,6 +66,22 @@ const (
 	MethodPTYClose         = "pty.close"
 	MethodAIList           = "ai.list"
 )
+
+// AllMethods is every RPC method the agent speaks. Keep in lockstep with the
+// consts above — new MethodX goes here in the same edit. Server handlers are
+// checked against this list so a forgotten handler fails the build's tests.
+var AllMethods = []string{
+	MethodHello, MethodPing, MethodHostLogin,
+	MethodWorkspaceRoots, MethodWorkspaceOpen,
+	MethodFSList, MethodFSRead, MethodFSWrite, MethodFSMkdir, MethodFSDelete,
+	MethodFSRename, MethodFSCopy, MethodFSMove, MethodFSStat,
+	MethodFSWatch, MethodFSUnwatch, MethodFSSearch, MethodFSGrep, MethodFSReplaceInFiles,
+	MethodGitStatus, MethodGitStage, MethodGitUnstage, MethodGitDiscard,
+	MethodGitCommit, MethodGitPush, MethodGitPull, MethodGitDiff,
+	MethodGitBranches, MethodGitCheckout, MethodGitApplyHunk,
+	MethodPTYCreate, MethodPTYInput, MethodPTYResize, MethodPTYClose,
+	MethodAIList,
+}
 
 const (
 	EventPTYData   = "pty.data"

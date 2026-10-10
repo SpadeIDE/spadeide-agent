@@ -31,3 +31,23 @@ func TestFrameRejectsHuge(t *testing.T) {
 		t.Fatal("expected error")
 	}
 }
+
+func TestAuthFrameRejectsMiBWithoutAlloc(t *testing.T) {
+	var buf bytes.Buffer
+	// Declare 1 MiB — above MaxAuthFrameBytes, well below MaxFrameBytes.
+	_ = binaryBigEndianPutUint32(&buf, 1<<20)
+	_, err := readFrameLimit(&buf, MaxAuthFrameBytes)
+	if err == nil {
+		t.Fatal("expected rejection of 1 MiB pre-auth frame")
+	}
+}
+
+func binaryBigEndianPutUint32(buf *bytes.Buffer, n uint32) error {
+	var hdr [4]byte
+	hdr[0] = byte(n >> 24)
+	hdr[1] = byte(n >> 16)
+	hdr[2] = byte(n >> 8)
+	hdr[3] = byte(n)
+	_, err := buf.Write(hdr[:])
+	return err
+}

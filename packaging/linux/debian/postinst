@@ -2,6 +2,8 @@
 set -e
 
 if command -v systemctl >/dev/null 2>&1; then
+  mkdir -p /var/lib/spade-agent
+  chmod 700 /var/lib/spade-agent >/dev/null 2>&1 || true
   systemctl daemon-reload >/dev/null 2>&1 || true
   if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
     systemctl --user -M "${SUDO_USER}@" daemon-reload >/dev/null 2>&1 || true
@@ -9,13 +11,26 @@ if command -v systemctl >/dev/null 2>&1; then
   fi
 fi
 
+if command -v update-desktop-database >/dev/null 2>&1; then
+  update-desktop-database -q /usr/share/applications >/dev/null 2>&1 || true
+fi
+if command -v xdg-desktop-menu >/dev/null 2>&1; then
+  xdg-desktop-menu forceupdate >/dev/null 2>&1 || true
+fi
+if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+  gtk-update-icon-cache -q -t -f /usr/share/icons/hicolor >/dev/null 2>&1 || true
+fi
+if command -v update-icon-caches >/dev/null 2>&1; then
+  update-icon-caches /usr/share/icons/hicolor >/dev/null 2>&1 || true
+fi
+
 cat <<'EOF'
 
 SpadeIDE is installed.
 
-  spadeide          # QR + pair URL (starts the agent if needed)
-  spadeide status
-  spadeide stop
+  Open “SpadeIDE Agent” from Activities (app grid), or run:  spadeide
+  Terminal QR:  spadeide pair
+  Stop:         spadeide stop
 
   LAN discovery: sudo apt install avahi-daemon avahi-utils
 

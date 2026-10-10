@@ -1,9 +1,50 @@
 SpadeIDE for Debian / Ubuntu
 ============================
 
-One command:
+Which install?
+--------------
 
-  spadeide              start if needed, show QR + pair URL
+  Only you (default)     .deb → SpadeIDE Agent from the app grid
+                         No Unix password on the iPad; files under your $HOME.
+
+  Shared desktop /       Enable the system unit (below). Each iPad signs in
+  multi-user             with a Unix user once, then sees only that home.
+
+Desktop (.deb) — one person
+---------------------------
+
+After install, open **SpadeIDE Agent** from the app grid. It sits in the
+system tray with a pairing QR — same idea as the Mac menu-bar app.
+
+  spadeide-gui
+  spadeide desktop
+
+Default: runs as **your** Unix account (user unit). Explorer/editor stay
+under your `$HOME`. No Unix login sheet.
+
+Shared desktop / multi-user (privileged broker)
+-----------------------------------------------
+
+Same code path as a server. The packaged system unit runs as root; each
+iPad Unix-logs in once and is jailed to that account's home.
+
+  systemctl --user disable --now spade-agent   # stop the per-user copy
+  sudo mkdir -p /var/lib/spade-agent && sudo chmod 700 /var/lib/spade-agent
+  sudo systemctl enable --now spade-agent
+  sudo spadeide pair --no-start
+
+Do not run `sudo spadeide` to start a second listener — use the unit above.
+
+On the iPad: Pair → Unix Login (username + password, once) → Open Project.
+Password change, lock, or deleted user forces login again. Unix root refused.
+Terminal is that user’s normal login shell (same groups as SSH).
+
+Day to day
+----------
+
+  spadeide              start if needed, show QR + pair URL (user install)
+  sudo spadeide pair --no-start
+                        QR only when the system unit is already running
   spadeide status       paired / online tablets
   spadeide stop
   spadeide reset        forget paired devices
@@ -11,9 +52,9 @@ One command:
 Several tablets can stay paired. Each bare `spadeide` run issues a fresh
 pair secret for a new iPad.
 
-  sudo apt install ./spadeide_*.deb
-  spadeide
+  sudo apt install ./spadeide-agent_*.deb
 
 LAN discovery (IP changes): sudo apt install avahi-daemon avahi-utils
 
-Do not run as root.
+Unix login needs `unix_chkpwd` from libpam-modules (installed by default on
+Ubuntu Desktop and Server). Full docs: site → Docs → Linux agent.

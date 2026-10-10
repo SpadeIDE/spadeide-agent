@@ -12,6 +12,10 @@ import (
 // MaxFrameBytes bounds a single length-prefixed QUIC frame (matches WSS limit).
 const MaxFrameBytes = 64 << 20
 
+// MaxAuthFrameBytes bounds pre-auth frames. TLS uses RequestClientCert, so any
+// peer can complete the handshake — never allocate MaxFrameBytes before auth.
+const MaxAuthFrameBytes = 64 << 10
+
 // ALPN negotiated for SpadeIDE QUIC sessions.
 const QUICALPN = "spadeide"
 
@@ -48,14 +52,20 @@ func writeFrame(w io.Writer, env protocol.Envelope) error {
 	return err
 }
 
-// readFrame reads one length-prefixed JSON envelope from r.
+// readFrame reads one length-prefixed JSON envelope from r (post-auth).
 func readFrame(r io.Reader) (protocol.Envelope, error) {
+	return readFrameLimit(r, MaxFrameBytes)
+}
+
+// readFrameLimit reads one length-prefixed JSON envelope, rejecting declared
+// lengths above max without allocating.
+func readFrameLimit(r io.Reader, max uint32) (protocol.Envelope, error) {
 	var hdr [4]byte
 	if _, err := io.ReadFull(r, hdr[:]); err != nil {
 		return protocol.Envelope{}, err
 	}
 	n := binary.BigEndian.Uint32(hdr[:])
-	if n == 0 || n > MaxFrameBytes {
+	if n == 0 || n > max {
 		return protocol.Envelope{}, fmt.Errorf("invalid frame length %d", n)
 	}
 	buf := make([]byte, n)

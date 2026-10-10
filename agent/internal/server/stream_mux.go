@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 )
 
 // Logical stream IDs on a nested-TLS relay (and any future byte-pipe mux).
@@ -18,13 +19,19 @@ const (
 
 // streamMux multiplexes three bidirectional logical streams over one net.Conn.
 // Wire frame: u8 stream_id ‖ u32be length ‖ payload.
+//
+// Starts with MaxAuthFrameBytes / a matching buffer cap so an unauthenticated
+// peer cannot force a 64 MiB allocation or fill rpc/pty buffers before
+// authenticateControl returns. Call UnlockFrames after auth.
 type streamMux struct {
-	conn   net.Conn
-	writeMu sync.Mutex
-	streams [streamCount]*muxStream
-	closed  chan struct{}
+	conn      net.Conn
+	writeMu   sync.Mutex
+	streams   [streamCount]*muxStream
+	closed    chan struct{}
 	closeOnce sync.Once
-	readErr error
+	readErr   error
+	maxFrame  atomic.Uint32
+	maxBuf    atomic.Uint32
 }
 
 type muxStream struct {
@@ -40,6 +47,8 @@ func newStreamMux(conn net.Conn) *streamMux {
 		conn:   conn,
 		closed: make(chan struct{}),
 	}
+	m.maxFrame.Store(MaxAuthFrameBytes)
+	m.maxBuf.Store(MaxAuthFrameBytes)
 	for i := byte(0); i < streamCount; i++ {
 		m.streams[i] = &muxStream{
 			id:   i,
@@ -48,6 +57,12 @@ func newStreamMux(conn net.Conn) *streamMux {
 		}
 	}
 	return m
+}
+
+// UnlockFrames raises demux limits after the peer is authenticated.
+func (m *streamMux) UnlockFrames() {
+	m.maxFrame.Store(MaxFrameBytes)
+	m.maxBuf.Store(MaxFrameBytes)
 }
 
 func (m *streamMux) Stream(id byte) *muxStream {
@@ -79,8 +94,9 @@ func (m *streamMux) Serve() {
 		}
 		sid := hdr[0]
 		n := binary.BigEndian.Uint32(hdr[1:5])
-		if sid >= streamCount || n == 0 || n > MaxFrameBytes {
-			m.readErr = fmt.Errorf("bad mux frame sid=%d n=%d", sid, n)
+		maxFrame := m.maxFrame.Load()
+		if sid >= streamCount || n == 0 || n > maxFrame {
+			m.readErr = fmt.Errorf("bad mux frame sid=%d n=%d (max=%d)", sid, n, maxFrame)
 			return
 		}
 		buf := make([]byte, n)
@@ -90,6 +106,11 @@ func (m *streamMux) Serve() {
 		}
 		s := m.streams[sid]
 		s.mu.Lock()
+		if uint32(len(s.buf))+n > m.maxBuf.Load() {
+			s.mu.Unlock()
+			m.readErr = fmt.Errorf("mux stream %d buffer overflow (%d+%d)", sid, len(s.buf), n)
+			return
+		}
 		s.buf = append(s.buf, buf...)
 		s.mu.Unlock()
 		s.signal()
@@ -129,8 +150,9 @@ func (s *muxStream) Write(p []byte) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
 	}
-	if len(p) > MaxFrameBytes {
-		return 0, fmt.Errorf("mux frame too large: %d", len(p))
+	maxFrame := s.mux.maxFrame.Load()
+	if uint32(len(p)) > maxFrame {
+		return 0, fmt.Errorf("mux frame too large: %d (max=%d)", len(p), maxFrame)
 	}
 	hdr := [5]byte{s.id}
 	binary.BigEndian.PutUint32(hdr[1:5], uint32(len(p)))

@@ -38,9 +38,14 @@ func (c *wsConn) Read(p []byte) (int, error) {
 		} else {
 			_ = c.ws.SetReadDeadline(dl)
 		}
-		_, data, err := c.ws.ReadMessage()
+		typ, data, err := c.ws.ReadMessage()
 		if err != nil {
 			return 0, err
+		}
+		// Hub may emit text control frames (e.g. legacy {"t":"paired"}). Nested
+		// TLS is binary-only — skip text so older rendezvous builds still work.
+		if typ == websocket.TextMessage {
+			continue
 		}
 		c.buf = data
 	}

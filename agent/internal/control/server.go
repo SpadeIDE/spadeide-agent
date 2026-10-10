@@ -10,13 +10,15 @@ import (
 	"fmt"
 	"net"
 	"net/http"
-	"os"
 	"strings"
 	"time"
 
+	"github.com/skip2/go-qrcode"
 	"github.com/spadeide/spade-agent/internal/auth"
 	"github.com/spadeide/spade-agent/internal/config"
+	"github.com/spadeide/spade-agent/internal/httpx"
 	"github.com/spadeide/spade-agent/internal/ratelimit"
+	"github.com/spadeide/spade-agent/internal/rendezvous"
 	"github.com/spadeide/spade-agent/internal/server"
 )
 
@@ -73,10 +75,10 @@ func New(port int, store *config.Store, authMgr *auth.Manager, agent *server.Ser
 		port = config.DefaultControlPort
 	}
 	return &Server{
-		Port:    port,
-		Store:   store,
-		Auth:    authMgr,
-		Agent:   agent,
+		Port:  port,
+		Store: store,
+		Auth:  authMgr,
+		Agent: agent,
 		limiter: ratelimit.New(ratelimit.Config{
 			Rate:       5,
 			Burst:      10,
@@ -90,7 +92,7 @@ func New(port int, store *config.Store, authMgr *auth.Manager, agent *server.Ser
 // EnsureToken loads SPADE_CONTROL_TOKEN or mints one, writes it 0600 next to
 // agent.pid, and stores it for guard(). Empty token is never allowed.
 func (s *Server) EnsureToken() (string, error) {
-	token := strings.TrimSpace(os.Getenv("SPADE_CONTROL_TOKEN"))
+	token := config.EnvControlTokenValue()
 	if token == "" {
 		token = strings.TrimSpace(s.Store.ReadControlToken())
 	}
@@ -119,10 +121,11 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/status", s.guard(s.handleStatus))
-	mux.HandleFunc("/v1/pair/rotate", s.guard(s.handleRotate))
-	mux.HandleFunc("/v1/pair/reset", s.guard(s.handleReset))
-	mux.HandleFunc("/v1/pair/devices/", s.guard(s.handleDevice))
+	mux.HandleFunc("/v1/status", s.guard(httpx.Method(http.MethodGet, s.handleStatus)))
+	mux.HandleFunc("/v1/pair/qr.png", s.guard(httpx.Method(http.MethodGet, s.handleQR)))
+	mux.HandleFunc("/v1/pair/rotate", s.guard(httpx.Method(http.MethodPost, s.handleRotate)))
+	mux.HandleFunc("/v1/pair/reset", s.guard(httpx.Method(http.MethodPost, s.handleReset)))
+	mux.HandleFunc("/v1/pair/devices/", s.guard(httpx.Method(http.MethodDelete, s.handleDevice)))
 	mux.HandleFunc("/v1/remote", s.guard(s.handleRemote))
 
 	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", s.Port))
@@ -147,7 +150,7 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 
 func (s *Server) guard(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		key := clientKey(r)
+		key := httpx.ClientIP(r)
 		if !s.limiter.Allow(key) {
 			http.Error(w, "too many requests", http.StatusTooManyRequests)
 			return
@@ -172,43 +175,39 @@ func (s *Server) guard(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-func clientKey(r *http.Request) string {
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		return r.RemoteAddr
-	}
-	return host
+func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
+	httpx.WriteJSON(w, s.snapshot())
 }
 
-func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+func (s *Server) handleQR(w http.ResponseWriter, r *http.Request) {
+	url := s.Agent.PairURL()
+	if url == "" {
+		http.Error(w, "no pair URL", http.StatusNotFound)
 		return
 	}
-	writeJSON(w, s.snapshot())
+	png, err := qrcode.Encode(url, qrcode.Medium, 256)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "image/png")
+	w.Header().Set("Cache-Control", "no-store")
+	_, _ = w.Write(png)
 }
 
 func (s *Server) handleRotate(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
 	s.Auth.RotatePairSecret()
-	writeJSON(w, s.snapshot())
+	httpx.WriteJSON(w, s.snapshot())
 }
 
 func (s *Server) handleReset(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
 	if err := s.Store.ResetPairing(); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	s.Agent.DisconnectAll()
 	s.Auth.RotatePairSecret()
-	writeJSON(w, s.snapshot())
+	httpx.WriteJSON(w, s.snapshot())
 }
 
 func (s *Server) handleDevice(w http.ResponseWriter, r *http.Request) {
@@ -216,10 +215,6 @@ func (s *Server) handleDevice(w http.ResponseWriter, r *http.Request) {
 	id = strings.Trim(id, "/")
 	if id == "" {
 		http.Error(w, "device id required", http.StatusBadRequest)
-		return
-	}
-	if r.Method != http.MethodDelete {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 	ok, err := s.Store.RemoveDevice(id)
@@ -232,25 +227,31 @@ func (s *Server) handleDevice(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.Agent.DisconnectDevice(id)
-	writeJSON(w, s.snapshot())
+	httpx.WriteJSON(w, s.snapshot())
 }
 
 type remoteBody struct {
-	Enabled bool   `json:"enabled"`
-	Server  string `json:"server,omitempty"`
+	Enabled *bool   `json:"enabled"`
+	Server  *string `json:"server"`
 }
 
 func (s *Server) handleRemote(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
-		writeJSON(w, s.snapshot())
+		httpx.WriteJSON(w, s.snapshot())
 	case http.MethodPost:
 		var body remoteBody
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			http.Error(w, "invalid json", http.StatusBadRequest)
 			return
 		}
-		if err := s.Store.SetRemoteAccess(body.Enabled, body.Server); err != nil {
+		if body.Server != nil {
+			if err := rendezvous.ValidateServerURL(*body.Server); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+		}
+		if err := s.Store.UpdateRemoteAccess(body.Enabled, body.Server); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
@@ -258,7 +259,7 @@ func (s *Server) handleRemote(w http.ResponseWriter, r *http.Request) {
 			on, srv, _ := s.Store.RemoteAccess()
 			s.Remote.Apply(on, srv)
 		}
-		writeJSON(w, s.snapshot())
+		httpx.WriteJSON(w, s.snapshot())
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
@@ -267,8 +268,9 @@ func (s *Server) handleRemote(w http.ResponseWriter, r *http.Request) {
 func (s *Server) snapshot() Status {
 	secret, exp := s.Auth.PairSecret()
 	st, _ := s.Store.LoadState()
+	clients := s.Agent.ClientInfos()
 	online := map[string]bool{}
-	for _, c := range s.Agent.ClientInfos() {
+	for _, c := range clients {
 		online[c.ID] = true
 	}
 	devices := make([]DeviceInfo, 0, len(st.Devices))
@@ -302,11 +304,6 @@ func (s *Server) snapshot() Status {
 		RemoteServer:      st.RemoteServer,
 		RemoteRegistered:  remoteRegistered,
 		Devices:           devices,
-		Clients:           s.Agent.ClientInfos(),
+		Clients:           clients,
 	}
-}
-
-func writeJSON(w http.ResponseWriter, v any) {
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(v)
 }

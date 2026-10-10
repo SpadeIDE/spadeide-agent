@@ -15,6 +15,23 @@ type HelloResult struct {
 	Home    string `json:"home"`
 	Shell   string `json:"shell"`
 	Host    string `json:"host"`
+	// Mode is "user" (agent is this Unix account) or "system" (privileged
+	// broker; iPad must host.login once, then is jailed to that home).
+	Mode string `json:"mode,omitempty"`
+	// UnixUser is the bound host account in system mode, empty until login.
+	UnixUser string `json:"unixUser,omitempty"`
+}
+
+// HostLoginParams is Unix username+password over the already-authenticated
+// TLS session. Password is never logged or persisted.
+type HostLoginParams struct {
+	Username string `json:"username"`
+	Password string `json:"password"`
+}
+
+type HostLoginResult struct {
+	UnixUser string `json:"unixUser"`
+	Home     string `json:"home"`
 }
 
 type PathParams struct {
@@ -140,6 +157,7 @@ type ReplaceInFilesParams struct {
 type ReplaceInFilesResult struct {
 	FilesChanged int `json:"filesChanged"`
 	Replacements int `json:"replacements"`
+	Skipped      int `json:"skipped,omitempty"`
 }
 
 type FSChangedParams struct {
@@ -321,7 +339,6 @@ type PairRequest struct {
 }
 
 type PairResponse struct {
-	Token       string `json:"token,omitempty"` // legacy unused; mTLS only
 	HostName    string `json:"hostName"`
 	Fingerprint string `json:"fingerprint"`
 	AgentID     string `json:"agentId,omitempty"`

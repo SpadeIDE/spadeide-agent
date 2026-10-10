@@ -13,20 +13,18 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
-	"github.com/spadeide/spade-agent/internal/ai"
 	"github.com/spadeide/spade-agent/internal/auth"
 	"github.com/spadeide/spade-agent/internal/config"
 	fsaccess "github.com/spadeide/spade-agent/internal/fs"
 	gitpkg "github.com/spadeide/spade-agent/internal/git"
+	"github.com/spadeide/spade-agent/internal/httpx"
 	"github.com/spadeide/spade-agent/internal/identity"
-	"github.com/spadeide/spade-agent/internal/platform"
 	"github.com/spadeide/spade-agent/internal/protocol"
 	ptypkg "github.com/spadeide/spade-agent/internal/pty"
 	"github.com/spadeide/spade-agent/internal/ratelimit"
@@ -48,7 +46,8 @@ type Server struct {
 	Host     string
 	LocalIP  string
 
-	pairLimit *ratelimit.Limiter
+	pairLimit  *ratelimit.Limiter
+	loginLimit *ratelimit.Limiter
 
 	mu      sync.Mutex
 	clients map[*client]struct{}
@@ -63,9 +62,9 @@ type client struct {
 	// Exactly one of conn (WebSocket) or the QUIC stream trio is set.
 	conn *websocket.Conn
 
-	control streamWriter
-	rpc     streamWriter
-	ptyOut  streamWriter
+	control   streamWriter
+	rpc       streamWriter
+	ptyOut    streamWriter
 	controlMu sync.Mutex
 	rpcMu     sync.Mutex
 	ptyMu     sync.Mutex
@@ -74,8 +73,15 @@ type client struct {
 	// the response (QUIC only). Safe for concurrent fs.* handlers.
 	replyStreams sync.Map // string → streamWriter
 
+	// sessMu covers unixUser, fs, pty (swapped on host.login) and device field
+	// mutations (Unix bind). The device *pointer* is set once at connect and
+	// not reassigned; ID/Name reads during Disconnect/ClientInfos are stable.
+	sessMu     sync.RWMutex
 	device     *config.Device
+	unixUser   string
+	srv        *Server
 	fs         *fsaccess.Service
+	git        *gitpkg.Service
 	pty        *ptypkg.Manager
 	writeMu    sync.Mutex // WebSocket only (one writer)
 	forceClose func()
@@ -156,13 +162,20 @@ func New(port int, store *config.Store, authMgr *auth.Manager, id *identity.Agen
 			LockoutMin: 2 * time.Second,
 			LockoutMax: 10 * time.Minute,
 		}),
+		loginLimit: ratelimit.New(ratelimit.Config{
+			Rate:       1,
+			Burst:      5,
+			FailLimit:  5,
+			LockoutMin: 2 * time.Second,
+			LockoutMax: 10 * time.Minute,
+		}),
 	}
 }
 
 func (s *Server) ListenAndServe(ctx context.Context) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/pair/info", s.handlePairInfo)
-	mux.HandleFunc("/pair", s.handlePair)
+	mux.HandleFunc("/pair", httpx.Method(http.MethodPost, s.handlePair))
 	mux.HandleFunc("/v1", s.handleWS)
 
 	tlsCfg := s.Auth.TLSConfig()
@@ -302,35 +315,31 @@ func (s *Server) handlePairInfo(w http.ResponseWriter, r *http.Request) {
 	if s.Identity != nil {
 		info.AgentID = s.Identity.ID
 	}
-	writeJSON(w, info)
+	httpx.WriteJSON(w, info)
 }
 
 func (s *Server) handlePair(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	key := pairClientKey(r)
+	key := httpx.ClientIP(r)
 	if !s.pairLimit.Allow(key) {
 		http.Error(w, "too many requests", http.StatusTooManyRequests)
 		return
 	}
 	var req protocol.PairRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeErr(w, http.StatusBadRequest, protocol.CodeInvalidParams, "invalid json")
+		httpx.WriteError(w, http.StatusBadRequest, protocol.CodeInvalidParams, "invalid json")
 		return
 	}
 	if req.DeviceID == "" || req.DeviceName == "" {
-		writeErr(w, http.StatusBadRequest, protocol.CodeInvalidParams, "deviceId and deviceName required")
+		httpx.WriteError(w, http.StatusBadRequest, protocol.CodeInvalidParams, "deviceId and deviceName required")
 		return
 	}
 	if req.DevicePub == "" {
-		writeErr(w, http.StatusBadRequest, protocol.CodeInvalidParams, "devicePub required")
+		httpx.WriteError(w, http.StatusBadRequest, protocol.CodeInvalidParams, "devicePub required")
 		return
 	}
 	if _, err := s.Auth.ValidateAndPair(req.Secret, req.DeviceID, req.DeviceName, req.DevicePub); err != nil {
 		s.pairLimit.Failure(key)
-		writeErr(w, http.StatusUnauthorized, protocol.CodeBadSecret, err.Error())
+		httpx.WriteError(w, http.StatusUnauthorized, protocol.CodeBadSecret, err.Error())
 		return
 	}
 	s.pairLimit.Success(key)
@@ -349,15 +358,7 @@ func (s *Server) handlePair(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	writeJSON(w, resp)
-}
-
-func pairClientKey(r *http.Request) string {
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		return r.RemoteAddr
-	}
-	return host
+	httpx.WriteJSON(w, resp)
 }
 
 func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
@@ -380,42 +381,24 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	// overhead fits comfortably under this.
 	conn.SetReadLimit(64 << 20)
 
-	home, _ := os.UserHomeDir()
-	c := &client{conn: conn, device: dev, closed: make(chan struct{})}
-	c.forceClose = func() { _ = conn.Close() }
-	c.installIO()
-	c.fs = fsaccess.New(home, func(env protocol.Envelope) { c.send(env) })
-	c.pty = ptypkg.NewManager(platform.DefaultShell(), func(env protocol.Envelope) { c.send(env) })
-
-	s.mu.Lock()
-	s.clients[c] = struct{}{}
-	s.mu.Unlock()
-
-	defer func() {
-		c.shutdown()
-		c.pty.CloseAll()
-		c.fs.Close()
-		_ = conn.Close()
-		s.mu.Lock()
-		delete(s.clients, c)
-		s.mu.Unlock()
-	}()
-
-	log.Printf("client connected: %s (%s)", dev.Name, dev.ID)
-	go c.pingLoop()
-	for {
-		_, data, err := conn.ReadMessage()
-		if err != nil {
-			log.Printf("client disconnected: %s (%s): %v", dev.Name, dev.ID, err)
-			return
+	s.runSession(dev, sessionWires{
+		ws:         conn,
+		forceClose: func() { _ = conn.Close() },
+		label:      "ws",
+	}, func(c *client) error {
+		for {
+			_, data, err := conn.ReadMessage()
+			if err != nil {
+				return err
+			}
+			var env protocol.Envelope
+			if err := json.Unmarshal(data, &env); err != nil {
+				c.send(protocol.NewError("", protocol.CodeInvalidParams, "invalid json"))
+				continue
+			}
+			c.dispatchInbound(env, nil)
 		}
-		var env protocol.Envelope
-		if err := json.Unmarshal(data, &env); err != nil {
-			c.send(protocol.NewError("", protocol.CodeInvalidParams, "invalid json"))
-			continue
-		}
-		c.dispatchInbound(env, nil)
-	}
+	})
 }
 
 func (c *client) send(env protocol.Envelope) {
@@ -479,416 +462,34 @@ func (c *client) mutexFor(w streamWriter) *sync.Mutex {
 }
 
 // dispatchInbound runs handle for one envelope, binding responses to reply
-// when non-nil (QUIC stream affinity). Filesystem calls run concurrently.
+// when non-nil (QUIC stream affinity).
+//
+// Always asynchronous: the WebSocket / QUIC read loop must keep draining.
+// git.status used to run inline, so a scan of a large home directory (or a
+// hanging stat) stalled every fs.read / fs.write on the same stream. The iPad
+// stayed "Connected" because ping lives on the control stream.
 func (c *client) dispatchInbound(env protocol.Envelope, reply streamWriter) {
-	run := func() {
+	go func() {
 		if reply != nil && env.ID != "" {
 			c.replyStreams.Store(env.ID, reply)
 			defer c.replyStreams.Delete(env.ID)
 		}
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("rpc panic method=%s id=%s: %v\n%s", env.Method, env.ID, r, stackTrace())
+				if env.ID != "" {
+					c.send(protocol.NewError(env.ID, protocol.CodeInternal, "internal error"))
+				}
+			}
+		}()
 		c.handle(env)
-	}
-	if strings.HasPrefix(env.Method, "fs.") {
-		go run()
-	} else {
-		run()
-	}
+	}()
 }
 
-// decodeParams unmarshals env.Params into T, answering invalid_params and
-// reporting false when the payload doesn't fit.
-func decodeParams[T any](c *client, env protocol.Envelope) (T, bool) {
-	var p T
-	if err := json.Unmarshal(env.Params, &p); err != nil {
-		c.send(protocol.NewError(env.ID, protocol.CodeInvalidParams, err.Error()))
-		return p, false
-	}
-	return p, true
-}
-
-// errorCode maps a filesystem error to its protocol code. Uses errors.Is on the
-// fsaccess sentinels, so the mapping never depends on message text.
-func errorCode(err error) string {
-	switch {
-	case errors.Is(err, fsaccess.ErrOutsideRoots),
-		errors.Is(err, fsaccess.ErrSymlinkEscape),
-		errors.Is(err, fsaccess.ErrBrowseOnly):
-		return protocol.CodeForbidden
-	case errors.Is(err, fsaccess.ErrInvalidPattern):
-		return protocol.CodeInvalidParams
-	case errors.Is(err, os.ErrNotExist):
-		return protocol.CodeNotFound
-	default:
-		return protocol.CodeIOError
-	}
-}
-
-// reply answers with result, or with the mapped error when err is non-nil.
-func (c *client) reply(id string, result any, err error) {
-	if err != nil {
-		c.send(protocol.NewError(id, errorCode(err), err.Error()))
-		return
-	}
-	c.send(protocol.NewResponse(id, result))
-}
-
-// ack answers with an empty result, or with err under the given code.
-func (c *client) ack(id string, err error, code string) {
-	if err != nil {
-		c.send(protocol.NewError(id, code, err.Error()))
-		return
-	}
-	c.send(protocol.NewResponse(id, map[string]any{}))
-}
-
-func (c *client) handle(env protocol.Envelope) {
-	if env.Method == "" {
-		c.send(protocol.NewError(env.ID, protocol.CodeInvalidParams, "missing method"))
-		return
-	}
-	switch env.Method {
-	case protocol.MethodHello:
-		c.send(protocol.NewResponse(env.ID, protocol.HelloResult{
-			Agent:   config.AppName,
-			Version: config.Version,
-			OS:      runtime.GOOS,
-			Arch:    runtime.GOARCH,
-			Home:    mustHome(),
-			Shell:   platform.DefaultShell(),
-			Host:    mustHostname(),
-		}))
-	case protocol.MethodPing:
-		c.send(protocol.NewResponse(env.ID, map[string]bool{"pong": true}))
-	case protocol.MethodWorkspaceRoots:
-		c.send(protocol.NewResponse(env.ID, protocol.WorkspaceRootsResult{Roots: c.fs.Roots()}))
-	case protocol.MethodWorkspaceOpen:
-		p, ok := decodeParams[protocol.PathParams](c, env)
-		if !ok {
-			return
-		}
-		if err := c.fs.AddRoot(p.Path); err != nil {
-			c.reply(env.ID, nil, err)
-			return
-		}
-		// Report the path as the agent resolved it, not as the client spelled it.
-		opened := p.Path
-		if st, err := c.fs.Stat(p.Path); err == nil {
-			opened = st.Path
-		}
-		c.setWorkspace(opened)
-		c.send(protocol.NewResponse(env.ID, protocol.WorkspaceOpenResult{
-			Path: opened,
-			Name: filepath.Base(opened),
-		}))
-	case protocol.MethodFSList:
-		c.handlePath(env, func(path string) (any, error) { return c.fs.List(path) })
-	case protocol.MethodFSStat:
-		c.handlePath(env, func(path string) (any, error) { return c.fs.Stat(path) })
-	case protocol.MethodFSRead:
-		c.handlePath(env, func(path string) (any, error) { return c.fs.Read(path) })
-	case protocol.MethodFSMkdir:
-		c.handlePath(env, func(path string) (any, error) {
-			return map[string]string{"path": path}, c.fs.Mkdir(path)
-		})
-	case protocol.MethodFSDelete:
-		c.handlePath(env, func(path string) (any, error) {
-			return map[string]string{"path": path}, c.fs.Delete(path)
-		})
-	case protocol.MethodFSWatch:
-		c.handlePath(env, func(path string) (any, error) {
-			id, err := c.fs.Watch(path)
-			return protocol.WatchResult{WatchID: id}, err
-		})
-	case protocol.MethodFSWrite:
-		p, ok := decodeParams[protocol.WriteParams](c, env)
-		if !ok {
-			return
-		}
-		res, err := c.fs.Write(p.Path, p.Content)
-		c.reply(env.ID, res, err)
-	case protocol.MethodFSRename:
-		p, ok := decodeParams[protocol.RenameParams](c, env)
-		if !ok {
-			return
-		}
-		path, err := c.fs.Rename(p.From, p.To)
-		c.reply(env.ID, map[string]string{"path": path}, err)
-	case protocol.MethodFSCopy, protocol.MethodFSMove:
-		p, ok := decodeParams[protocol.CopyParams](c, env)
-		if !ok {
-			return
-		}
-		var path string
-		var err error
-		if env.Method == protocol.MethodFSMove {
-			path, err = c.fs.Move(p.From, p.ToDir)
-		} else {
-			path, err = c.fs.Copy(p.From, p.ToDir)
-		}
-		c.reply(env.ID, map[string]string{"path": path}, err)
-	case protocol.MethodFSSearch:
-		p, ok := decodeParams[protocol.SearchParams](c, env)
-		if !ok {
-			return
-		}
-		root := p.Root
-		if root == "" {
-			root = c.getWorkspace()
-		}
-		res, err := c.fs.Search(root, p.Limit)
-		c.reply(env.ID, res, err)
-	case protocol.MethodFSGrep:
-		p, ok := decodeParams[protocol.GrepParams](c, env)
-		if !ok {
-			return
-		}
-		if p.Root == "" {
-			p.Root = c.getWorkspace()
-		}
-		start := time.Now()
-		res, err := c.fs.Grep(p)
-		if err != nil {
-			log.Printf("fs.grep failed q=%q root=%s dur=%s: %v", p.Query, p.Root, time.Since(start).Round(time.Millisecond), err)
-			c.reply(env.ID, nil, err)
-			return
-		}
-		log.Printf("fs.grep q=%q root=%s matches=%d truncated=%v dur=%s",
-			p.Query, p.Root, len(res.Matches), res.Truncated, time.Since(start).Round(time.Millisecond))
-		c.send(protocol.NewResponse(env.ID, res))
-	case protocol.MethodFSReplaceInFiles:
-		p, ok := decodeParams[protocol.ReplaceInFilesParams](c, env)
-		if !ok {
-			return
-		}
-		if p.Root == "" {
-			p.Root = c.getWorkspace()
-		}
-		res, err := c.fs.ReplaceInFiles(p)
-		c.reply(env.ID, res, err)
-	case protocol.MethodFSUnwatch:
-		p, ok := decodeParams[protocol.UnwatchParams](c, env)
-		if !ok {
-			return
-		}
-		c.ack(env.ID, c.fs.Unwatch(p.WatchID), protocol.CodeNotFound)
-	case protocol.MethodGitStatus:
-		root, ok := c.gitRoot(env, "")
-		if !ok {
-			return
-		}
-		res, err := gitpkg.New().Status(root)
-		c.reply(env.ID, res, err)
-	case protocol.MethodGitStage, protocol.MethodGitUnstage, protocol.MethodGitDiscard:
-		p, ok := decodeParams[protocol.GitPathsParams](c, env)
-		if !ok {
-			return
-		}
-		root, ok := c.gitRoot(env, p.Root)
-		if !ok {
-			return
-		}
-		paths, ok := c.allowWriteAll(env, p.Paths)
-		if !ok {
-			return
-		}
-		git := gitpkg.New()
-		var err error
-		switch env.Method {
-		case protocol.MethodGitStage:
-			err = git.Stage(root, paths)
-		case protocol.MethodGitUnstage:
-			err = git.Unstage(root, paths)
-		default:
-			err = git.Discard(root, paths)
-		}
-		c.ack(env.ID, err, protocol.CodeIOError)
-	case protocol.MethodGitCommit:
-		p, ok := decodeParams[protocol.GitCommitParams](c, env)
-		if !ok {
-			return
-		}
-		root, ok := c.gitRoot(env, p.Root)
-		if !ok {
-			return
-		}
-		res, err := gitpkg.New().Commit(root, p.Message, p.StageAll, p.Amend)
-		c.reply(env.ID, res, err)
-	case protocol.MethodGitPush, protocol.MethodGitPull:
-		p, ok := decodeParams[protocol.GitPathsParams](c, env)
-		if !ok {
-			return
-		}
-		root, ok := c.gitRoot(env, p.Root)
-		if !ok {
-			return
-		}
-		git := gitpkg.New()
-		var res *protocol.GitPushResult
-		var err error
-		if env.Method == protocol.MethodGitPush {
-			res, err = git.Push(root)
-		} else {
-			res, err = git.Pull(root)
-		}
-		c.reply(env.ID, res, err)
-	case protocol.MethodGitDiff:
-		p, ok := decodeParams[protocol.GitDiffParams](c, env)
-		if !ok {
-			return
-		}
-		root, ok := c.gitRoot(env, p.Root)
-		if !ok {
-			return
-		}
-		path, ok := c.allowWriteAll(env, []string{p.Path})
-		if !ok {
-			return
-		}
-		res, err := gitpkg.New().Diff(root, path[0], p.Staged, p.AgainstHead)
-		c.reply(env.ID, res, err)
-	case protocol.MethodGitApplyHunk:
-		p, ok := decodeParams[protocol.GitHunkParams](c, env)
-		if !ok {
-			return
-		}
-		root, ok := c.gitRoot(env, p.Root)
-		if !ok {
-			return
-		}
-		path, ok := c.allowWriteAll(env, []string{p.Path})
-		if !ok {
-			return
-		}
-		c.ack(env.ID, gitpkg.New().ApplyHunk(root, path[0], p.HunkIndex, p.Mode), protocol.CodeIOError)
-	case protocol.MethodGitBranches:
-		root, ok := c.gitRoot(env, "")
-		if !ok {
-			return
-		}
-		res, err := gitpkg.New().Branches(root)
-		c.reply(env.ID, res, err)
-	case protocol.MethodGitCheckout:
-		p, ok := decodeParams[protocol.GitCheckoutParams](c, env)
-		if !ok {
-			return
-		}
-		root, ok := c.gitRoot(env, p.Root)
-		if !ok {
-			return
-		}
-		c.ack(env.ID, gitpkg.New().Checkout(root, p.Branch, p.Create), protocol.CodeIOError)
-	case protocol.MethodPTYCreate:
-		p, ok := decodeParams[protocol.PTYCreateParams](c, env)
-		if !ok {
-			return
-		}
-		cwd := p.Cwd
-		if cwd == "" {
-			cwd = c.getWorkspace()
-		}
-		if cwd == "" {
-			cwd = mustHome()
-		}
-		id, err := c.pty.Create(p.Cols, p.Rows, cwd)
-		if err != nil {
-			c.send(protocol.NewError(env.ID, protocol.CodeInternal, err.Error()))
-			return
-		}
-		c.send(protocol.NewResponse(env.ID, protocol.PTYCreateResult{PTYID: id}))
-	case protocol.MethodPTYInput:
-		p, ok := decodeParams[protocol.PTYInputParams](c, env)
-		if !ok {
-			return
-		}
-		c.ack(env.ID, c.pty.Input(p.PTYID, p.Data), protocol.CodeIOError)
-	case protocol.MethodPTYResize:
-		p, ok := decodeParams[protocol.PTYResizeParams](c, env)
-		if !ok {
-			return
-		}
-		c.ack(env.ID, c.pty.Resize(p.PTYID, p.Cols, p.Rows), protocol.CodeIOError)
-	case protocol.MethodPTYClose:
-		p, ok := decodeParams[protocol.PTYIDParams](c, env)
-		if !ok {
-			return
-		}
-		_ = c.pty.Close(p.PTYID)
-		c.ack(env.ID, nil, "")
-	case protocol.MethodAIList:
-		found := ai.Detect()
-		agents := make([]protocol.AIAgent, 0, len(found))
-		for _, a := range found {
-			agents = append(agents, protocol.AIAgent{ID: a.ID, Name: a.Name, Path: a.Path})
-		}
-		c.send(protocol.NewResponse(env.ID, protocol.AIListResult{Agents: agents}))
-	default:
-		c.send(protocol.NewError(env.ID, protocol.CodeNotFound, "unknown method: "+env.Method))
-	}
-}
-
-// gitRoot picks the directory git runs in. Only the opened project qualifies:
-// git writes, so an arbitrary client-supplied path would step around the same
-// sandbox that guards fs.write.
-func (c *client) gitRoot(env protocol.Envelope, requested string) (string, bool) {
-	root := requested
-	if root == "" {
-		root = c.getWorkspace()
-	}
-	if root == "" {
-		c.send(protocol.NewError(env.ID, protocol.CodeForbidden, "no project is open"))
-		return "", false
-	}
-	resolved, err := c.fs.AllowWrite(root)
-	if err != nil {
-		c.send(protocol.NewError(env.ID, errorCode(err), err.Error()))
-		return "", false
-	}
-	return resolved, true
-}
-
-// allowWriteAll runs every path past the sandbox before git is let near them.
-func (c *client) allowWriteAll(env protocol.Envelope, paths []string) ([]string, bool) {
-	out := make([]string, 0, len(paths))
-	for _, p := range paths {
-		resolved, err := c.fs.AllowWrite(p)
-		if err != nil {
-			c.send(protocol.NewError(env.ID, errorCode(err), err.Error()))
-			return nil, false
-		}
-		out = append(out, resolved)
-	}
-	return out, true
-}
-
-// handlePath runs fn for the `{ "path": … }` methods and answers with its result.
-func (c *client) handlePath(env protocol.Envelope, fn func(string) (any, error)) {
-	p, ok := decodeParams[protocol.PathParams](c, env)
-	if !ok {
-		return
-	}
-	res, err := fn(p.Path)
-	c.reply(env.ID, res, err)
-}
-
-func bearerToken(r *http.Request) string {
-	h := r.Header.Get("Authorization")
-	if strings.HasPrefix(strings.ToLower(h), "bearer ") {
-		return strings.TrimSpace(h[7:])
-	}
-	return r.URL.Query().Get("token")
-}
-
-func writeJSON(w http.ResponseWriter, v any) {
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(v)
-}
-
-func writeErr(w http.ResponseWriter, status int, code, msg string) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(map[string]any{
-		"error": map[string]string{"code": code, "message": msg},
-	})
+func stackTrace() string {
+	buf := make([]byte, 4096)
+	n := runtime.Stack(buf, false)
+	return string(buf[:n])
 }
 
 // primaryIPv4 picks the LAN address the iPad should dial. It prefers physical
@@ -941,11 +542,6 @@ func primaryIPv4() string {
 		return anyFallback
 	}
 	return "127.0.0.1"
-}
-
-func mustHome() string {
-	h, _ := os.UserHomeDir()
-	return h
 }
 
 func mustHostname() string {

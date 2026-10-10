@@ -3,22 +3,21 @@
 #
 # Default: user install → ~/.local/bin + systemd --user
 #   ./install.sh
-# System-wide (server):
-#   sudo ./install.sh --system [--user-name NAME]
+# System-wide privileged broker (server):
+#   sudo ./install.sh --system
 
 set -euo pipefail
 
 MODE=user
-SYS_USER="${SPADE_USER:-spade}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 
 usage() {
   cat <<'EOF'
-Usage: ./install.sh [--user|--system] [--user-name NAME]
+Usage: ./install.sh [--user|--system]
 
   --user         Install for this account (default): ~/.local/bin + systemd --user
-  --system       Install for a dedicated user (needs root): /usr/local/bin + systemd
-  --user-name    System account name (default: spade)
+  --system       Privileged broker (needs root): /usr/local/bin + systemd as root.
+                 Each iPad Unix-logs in once and is jailed to that user's home.
 EOF
 }
 
@@ -26,7 +25,10 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --user) MODE=user; shift ;;
     --system) MODE=system; shift ;;
-    --user-name) SYS_USER="$2"; shift 2 ;;
+    --user-name)
+      echo "note: --user-name is ignored; system install is a privileged broker, not a dedicated Unix user" >&2
+      shift 2
+      ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown option: $1" >&2; usage; exit 2 ;;
   esac
@@ -43,7 +45,10 @@ find_binary() {
   local c
   for c in \
     "$HERE/spadeide" \
+    "$HERE/spadeide-agent-linux-$want" \
     "$HERE/spadeide-linux-$want" \
+    "$HERE/../../dist/agent/spadeide-agent-linux-$want" \
+    "$HERE/../dist/agent/spadeide-agent-linux-$want" \
     "$HERE/../../dist/agent/spadeide-linux-$want" \
     "$HERE/../dist/agent/spadeide-linux-$want" \
     "$HERE/spade-agent" \
@@ -116,24 +121,29 @@ else
     echo "system install needs root (sudo ./install.sh --system)" >&2
     exit 1
   fi
-  if ! id -u "$SYS_USER" >/dev/null 2>&1; then
-    useradd --create-home --shell /bin/bash --system "$SYS_USER"
-  fi
-  home="$(getent passwd "$SYS_USER" | cut -d: -f6)"
+  install -d -m 0700 /var/lib/spade-agent
   install -m 0755 "$BIN" /usr/local/bin/spadeide
   rm -f /usr/local/bin/spade-agent
   unit=/etc/systemd/system/spade-agent.service
   if [[ -f "$UNIT_SYS" ]]; then
-    sed -e "s|^User=spade|User=$SYS_USER|" \
-        -e "s|/home/spade|$home|g" \
-        "$UNIT_SYS" > "$unit"
+    install -m 0644 "$UNIT_SYS" "$unit"
   fi
   systemctl daemon-reload
   systemctl enable --now spade-agent
+  # A leftover user unit (from ./install.sh) would fight this one for 7422.
+  if [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]]; then
+    sudo -u "$SUDO_USER" XDG_RUNTIME_DIR="/run/user/$(id -u "$SUDO_USER")" \
+      systemctl --user disable --now spade-agent 2>/dev/null || true
+  fi
   echo
-  echo "Agent is running as $SYS_USER."
-  echo "  sudo -u $SYS_USER spadeide"
-  echo "  systemctl status spade-agent"
+  echo "Agent is running as a privileged broker (systemd User=root)."
+  echo "  sudo systemctl status spade-agent"
+  echo "  hash -r"
+  echo "  sudo spadeide pair --no-start     # QR / status (talks to the unit)"
+  echo
+  echo "Each iPad signs in with a Unix username and password once, then only"
+  echo "sees that account's home. Do not run:  sudo spadeide"
+  echo "That tries to start a second agent and is refused."
   echo
   echo "LAN discovery: sudo apt install avahi-daemon avahi-utils"
   echo

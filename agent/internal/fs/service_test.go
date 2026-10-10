@@ -53,6 +53,22 @@ func TestAddRootRejectsFilesystemRoot(t *testing.T) {
 	}
 }
 
+func TestAddRootRejectsOutsideJail(t *testing.T) {
+	home := t.TempDir()
+	outside := t.TempDir()
+	svc := New(home, nil)
+	if err := svc.AddRoot(outside); err == nil {
+		t.Fatal("expected AddRoot outside home jail to fail")
+	}
+	inside := filepath.Join(home, "proj")
+	if err := os.Mkdir(inside, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.AddRoot(inside); err != nil {
+		t.Fatalf("AddRoot inside home: %v", err)
+	}
+}
+
 func TestResolveRejectsOutsideAllowlist(t *testing.T) {
 	root := t.TempDir()
 	s := newTestService(t, root)

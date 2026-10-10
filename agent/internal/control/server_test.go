@@ -1,6 +1,8 @@
 package control
 
 import (
+	"bytes"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -47,6 +49,39 @@ func TestGuardRejectsMissingToken(t *testing.T) {
 	h(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status=%d want 200", rec.Code)
+	}
+}
+
+func TestHandleQRReturnsPNG(t *testing.T) {
+	store, err := config.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	authMgr, err := auth.NewManager(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := identity.LoadOrCreate(store.Dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	agent := server.New(7422, store, authMgr, id)
+	s := New(0, store, authMgr, agent)
+	s.token = "secret-token"
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/v1/pair/qr.png", nil)
+	req.Header.Set("Authorization", "Bearer secret-token")
+	s.guard(s.handleQR)(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "image/png" {
+		t.Fatalf("content-type=%q", ct)
+	}
+	body := rec.Body.Bytes()
+	if len(body) < 8 || string(body[:8]) != "\x89PNG\r\n\x1a\n" {
+		t.Fatalf("not a PNG (%d bytes)", len(body))
 	}
 }
 
@@ -100,5 +135,121 @@ func TestGuardFailsClosedWhenTokenEmpty(t *testing.T) {
 	h(rec, req)
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("empty token must 401, got %d", rec.Code)
+	}
+}
+
+func TestHandleRemoteSetsServerWithoutClearingEnabled(t *testing.T) {
+	store, err := config.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetRemoteAccess(true, "wss://old.example"); err != nil {
+		t.Fatal(err)
+	}
+	authMgr, err := auth.NewManager(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := identity.LoadOrCreate(store.Dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := New(0, store, authMgr, server.New(0, store, authMgr, id))
+	s.token = "secret-token"
+
+	post := func(body any) *httptest.ResponseRecorder {
+		raw, err := json.Marshal(body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/v1/remote", bytes.NewReader(raw))
+		req.Header.Set("Authorization", "Bearer secret-token")
+		req.Header.Set("Content-Type", "application/json")
+		s.guard(s.handleRemote)(rec, req)
+		return rec
+	}
+
+	rec := post(map[string]any{"server": "wss://rv.example"})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	on, srv, err := store.RemoteAccess()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !on {
+		t.Fatal("enabled should stay true")
+	}
+	if srv != "wss://rv.example" {
+		t.Fatalf("server=%q", srv)
+	}
+
+	rec = post(map[string]any{"server": ""})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("clear status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	on, srv, err = store.RemoteAccess()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !on || srv != "" {
+		t.Fatalf("want enabled + empty server, got on=%v srv=%q", on, srv)
+	}
+
+	rec = post(map[string]any{"enabled": false})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("toggle status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	on, srv, err = store.RemoteAccess()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if on {
+		t.Fatal("expected remote off")
+	}
+	if srv != "" {
+		t.Fatalf("server should stay empty, got %q", srv)
+	}
+}
+
+func TestHandleRemoteRejectsInvalidServerURL(t *testing.T) {
+	store, err := config.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetRemoteAccess(true, "wss://good.example"); err != nil {
+		t.Fatal(err)
+	}
+	authMgr, err := auth.NewManager(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := identity.LoadOrCreate(store.Dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := New(0, store, authMgr, server.New(0, store, authMgr, id))
+	s.token = "secret-token"
+
+	raw, err := json.Marshal(map[string]any{"server": "https://not-ws.example"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/remote", bytes.NewReader(raw))
+	req.Header.Set("Authorization", "Bearer secret-token")
+	req.Header.Set("Content-Type", "application/json")
+	s.guard(s.handleRemote)(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d want 400 body=%s", rec.Code, rec.Body.String())
+	}
+
+	on, srv, err := store.RemoteAccess()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !on || srv != "wss://good.example" {
+		t.Fatalf("store mutated on bad URL: on=%v srv=%q", on, srv)
 	}
 }

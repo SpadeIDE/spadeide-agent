@@ -7,10 +7,18 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/spadeide/spade-agent/internal/platform"
 	"github.com/spadeide/spade-agent/internal/protocol"
+)
+
+// C4 PTY read path: larger reads + short coalesce so bulk output is fewer
+// envelopes while interactive keystrokes still flush within ptyCoalesceWait.
+const (
+	ptyReadSize     = 32 << 10 // 32 KiB
+	ptyCoalesceWait = 5 * time.Millisecond
 )
 
 type Session struct {
@@ -19,11 +27,26 @@ type Session struct {
 	file *os.File
 }
 
+// Identity is the Unix account a PTY must run as (system-mode broker).
+// UID 0 is ignored — the agent never starts a root shell.
+type Identity struct {
+	UID    uint32
+	GID    uint32
+	Groups []uint32 // existing memberships only (docker, sudo, …)
+	Home   string
+	User   string
+	Shell  string
+}
+
+// MaxSessions caps concurrent PTYs per client manager.
+const MaxSessions = 16
+
 type Manager struct {
 	mu       sync.Mutex
 	sessions map[string]*Session
 	onEvent  func(protocol.Envelope)
 	shell    string
+	ident    Identity
 }
 
 func NewManager(shell string, onEvent func(protocol.Envelope)) *Manager {
@@ -37,6 +60,27 @@ func NewManager(shell string, onEvent func(protocol.Envelope)) *Manager {
 	}
 }
 
+func (m *Manager) SetIdentity(id Identity) {
+	if id.UID == 0 {
+		id = Identity{}
+	}
+	m.mu.Lock()
+	m.ident = id
+	if id.Shell != "" {
+		m.shell = id.Shell
+	}
+	m.mu.Unlock()
+}
+
+func (m *Manager) LoginShell() string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.ident.Shell != "" {
+		return m.ident.Shell
+	}
+	return m.shell
+}
+
 func (m *Manager) Create(cols, rows int, cwd string) (string, error) {
 	if cols <= 0 {
 		cols = 80
@@ -44,26 +88,68 @@ func (m *Manager) Create(cols, rows int, cwd string) (string, error) {
 	if rows <= 0 {
 		rows = 24
 	}
+
+	m.mu.Lock()
+	ident := m.ident
+	shell := m.shell
+	nSess := len(m.sessions)
+	m.mu.Unlock()
+
+	if nSess >= MaxSessions {
+		return "", fmt.Errorf("too many terminals")
+	}
+	if ident.User != "" && ident.UID == 0 {
+		return "", fmt.Errorf("refusing root pty")
+	}
+
+	home := ident.Home
+	if home == "" {
+		home = platform.UserHome()
+	}
 	if cwd == "" {
-		cwd = platform.UserHome()
+		cwd = home
 	}
 	if cwd == "" {
 		cwd = "."
 	}
 	// Ensure cwd exists; fall back to home.
 	if st, err := os.Stat(cwd); err != nil || !st.IsDir() {
-		if h := platform.UserHome(); h != "" {
-			cwd = h
+		if home != "" {
+			cwd = home
 		}
 	}
 
-	cmd := platform.ShellCommand(m.shell)
+	cmd := platform.ShellCommand(shell)
 	cmd.Dir = cwd
 	cmd.Env = platform.EnrichEnv(os.Environ(), cols, rows)
+	if ident.User != "" {
+		overrides := map[string]string{
+			"HOME":    ident.Home,
+			"USER":    ident.User,
+			"LOGNAME": ident.User,
+			"SHELL":   shell,
+			// Don't leak the broker's systemd / sudo context into the user shell.
+			"SUDO_USER":        "",
+			"SUDO_UID":         "",
+			"SUDO_GID":         "",
+			"SUDO_COMMAND":     "",
+			"SPADE_AGENT_MODE": "",
+			"SPADE_AGENT_HOME": "",
+			"INVOCATION_ID":    "",
+		}
+		if ident.UID != 0 {
+			runtimeDir := fmt.Sprintf("/run/user/%d", ident.UID)
+			if st, err := os.Stat(runtimeDir); err == nil && st.IsDir() {
+				overrides["XDG_RUNTIME_DIR"] = runtimeDir
+			}
+		}
+		cmd.Env = platform.OverrideEnv(cmd.Env, overrides)
+		platform.SetCredential(cmd, ident.UID, ident.GID, ident.Groups)
+	}
 
 	ptmx, err := platform.StartPTY(cmd)
 	if err != nil {
-		return "", fmt.Errorf("start %s: %w", filepath.Base(m.shell), err)
+		return "", fmt.Errorf("start %s: %w", filepath.Base(shell), err)
 	}
 	// A failed initial resize is not fatal — the client resizes again on layout.
 	_ = platform.SetSize(ptmx, cols, rows)
@@ -71,6 +157,14 @@ func (m *Manager) Create(cols, rows int, cwd string) (string, error) {
 	id := uuid.NewString()
 	sess := &Session{ID: id, cmd: cmd, file: ptmx}
 	m.mu.Lock()
+	if len(m.sessions) >= MaxSessions {
+		m.mu.Unlock()
+		_ = ptmx.Close()
+		if cmd.Process != nil {
+			_ = platform.KillGroup(cmd)
+		}
+		return "", fmt.Errorf("too many terminals")
+	}
 	m.sessions[id] = sess
 	m.mu.Unlock()
 
@@ -80,17 +174,79 @@ func (m *Manager) Create(cols, rows int, cwd string) (string, error) {
 }
 
 func (m *Manager) readLoop(sess *Session) {
-	buf := make([]byte, 4096)
-	for {
-		n, err := sess.file.Read(buf)
-		if n > 0 && m.onEvent != nil {
-			m.onEvent(protocol.NewEvent(protocol.EventPTYData, protocol.PTYDataParams{
-				PTYID: sess.ID,
-				Data:  base64.StdEncoding.EncodeToString(buf[:n]),
-			}))
+	type readResult struct {
+		b   []byte
+		err error
+	}
+	// Dedicated reader: PTY masters on macOS don't reliably honour read deadlines.
+	reads := make(chan readResult, 1)
+	go func() {
+		buf := make([]byte, ptyReadSize)
+		for {
+			n, err := sess.file.Read(buf)
+			var b []byte
+			if n > 0 {
+				b = append([]byte(nil), buf[:n]...)
+			}
+			reads <- readResult{b: b, err: err}
+			if err != nil {
+				return
+			}
 		}
-		if err != nil {
-			return // EOF or a closed PTY; the exit event comes from waitLoop
+	}()
+
+	pending := make([]byte, 0, ptyReadSize)
+	var timer *time.Timer
+	var timerC <-chan time.Time
+
+	stopTimer := func() {
+		if timer == nil {
+			return
+		}
+		if !timer.Stop() {
+			select {
+			case <-timerC:
+			default:
+			}
+		}
+		timer = nil
+		timerC = nil
+	}
+
+	flush := func() {
+		stopTimer()
+		if len(pending) == 0 {
+			return
+		}
+		chunk := pending
+		pending = make([]byte, 0, ptyReadSize)
+		if m.onEvent == nil {
+			return
+		}
+		m.onEvent(protocol.NewEvent(protocol.EventPTYData, protocol.PTYDataParams{
+			PTYID: sess.ID,
+			Data:  base64.StdEncoding.EncodeToString(chunk),
+		}))
+	}
+
+	for {
+		select {
+		case r := <-reads:
+			if len(r.b) > 0 {
+				pending = append(pending, r.b...)
+				if len(pending) >= ptyReadSize {
+					flush()
+				} else if timer == nil {
+					timer = time.NewTimer(ptyCoalesceWait)
+					timerC = timer.C
+				}
+			}
+			if r.err != nil {
+				flush()
+				return // EOF or closed PTY; exit event comes from waitLoop
+			}
+		case <-timerC:
+			flush()
 		}
 	}
 }
@@ -153,9 +309,7 @@ func (m *Manager) Close(id string) error {
 		return nil
 	}
 	_ = sess.file.Close()
-	if sess.cmd.Process != nil {
-		_ = sess.cmd.Process.Kill()
-	}
+	_ = platform.KillGroup(sess.cmd)
 	return nil
 }
 

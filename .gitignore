@@ -1,9 +1,13 @@
 .DS_Store
+.env
 /agent/bin/
 /agent/spade-agent
 /dist/
 /github-release/
 **/.spade-agent/
+**/__pycache__/
+*.py[cod]
 *.exe
 *.test
 *.out
+.cursor

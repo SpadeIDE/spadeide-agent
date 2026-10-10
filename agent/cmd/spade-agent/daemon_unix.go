@@ -4,6 +4,7 @@ package main
 
 import (
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"strconv"
@@ -14,6 +15,31 @@ import (
 	"github.com/spadeide/spade-agent/internal/config"
 	"github.com/spadeide/spade-agent/internal/control"
 )
+
+var errAlreadyRunning = fmt.Errorf("already running")
+
+func refuseRoot() error {
+	if os.Geteuid() != 0 {
+		return nil
+	}
+	if config.IsSystemMode() {
+		return nil
+	}
+	return fmt.Errorf("refusing to run as root — a paired iPad would get a root shell.\nIf you installed with sudo ./install.sh --system, systemd already runs the agent:\n  sudo systemctl status spade-agent\n  sudo spadeide pair --no-start\nDo not start a second copy with: sudo spadeide")
+}
+
+func controlPortBusy() bool {
+	c, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", config.DefaultControlPort), 300*time.Millisecond)
+	if err != nil {
+		return false
+	}
+	_ = c.Close()
+	return true
+}
+
+func errForeignAgent() error {
+	return fmt.Errorf("another SpadeIDE agent is already listening on 127.0.0.1:%d\nTalk to it with:\n  sudo systemctl status spade-agent\n  sudo spadeide pair --no-start\nDo not start a second copy as root.", config.DefaultControlPort)
+}
 
 func processAlive(pid int) bool {
 	if pid <= 0 {
@@ -48,13 +74,36 @@ func agentRunning() bool {
 	return ok
 }
 
+// acquireInstanceLock exclusive-locks the pid file so systemd + `spadeide pair`
+// cannot run two serves that bind-fail and RestartSec=3 crash-loop.
+func acquireInstanceLock(pidPath string) (func(), error) {
+	f, err := os.OpenFile(pidPath, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		_ = f.Close()
+		return nil, errAlreadyRunning
+	}
+	return func() {
+		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+		_ = f.Close()
+	}, nil
+}
+
 // startDaemon re-execs this binary in the background (new session), waits until
 // the control API answers, then returns. systemd / --foreground stay attached.
 func startDaemon(extra []string) error {
+	if err := refuseRoot(); err != nil {
+		return err
+	}
 	if agentRunning() {
 		fmt.Println("SpadeIDE Agent is already running.")
 		fmt.Println("Show QR:  spadeide")
 		return nil
+	}
+	if controlPortBusy() {
+		return errForeignAgent()
 	}
 
 	exe, err := os.Executable()

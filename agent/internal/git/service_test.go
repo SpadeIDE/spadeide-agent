@@ -649,6 +649,20 @@ func TestDiscoverReposSkipsHeavyDirectories(t *testing.T) {
 	}
 }
 
+func TestDiscoverReposSkipsDotDirectories(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	project := t.TempDir()
+	initRepo(t, filepath.Join(project, ".local", "hidden"))
+	initRepo(t, filepath.Join(project, "visible"))
+
+	found, _ := discoverRepos(project)
+	if len(found) != 1 || filepath.Base(found[0]) != "visible" {
+		t.Fatalf("found = %v, want only the visible checkout", found)
+	}
+}
+
 func TestDiscoverReposRespectsDepth(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not installed")

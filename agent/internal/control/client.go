@@ -23,7 +23,7 @@ type Client struct {
 
 func DefaultClient() (*Client, error) {
 	port := config.DefaultControlPort
-	token := os.Getenv("SPADE_CONTROL_TOKEN")
+	token := config.EnvControlTokenValue()
 	store, err := config.NewStore("")
 	if err == nil {
 		if data, err := os.ReadFile(store.ControlPortPath()); err == nil {
@@ -144,7 +144,7 @@ func (c *Client) doOnce(req *http.Request, retryOnUnauthorized bool) (*Status, e
 
 // refreshToken picks up ~/.spade-agent/control.token written by a just-started agent.
 func (c *Client) refreshToken() {
-	if v := strings.TrimSpace(os.Getenv("SPADE_CONTROL_TOKEN")); v != "" {
+	if v := config.EnvControlTokenValue(); v != "" {
 		c.Token = v
 		return
 	}

@@ -6,14 +6,8 @@ import (
 	"io"
 	"log"
 	"net"
-	"os"
 	"sync"
 	"time"
-
-	fsaccess "github.com/spadeide/spade-agent/internal/fs"
-	"github.com/spadeide/spade-agent/internal/platform"
-	"github.com/spadeide/spade-agent/internal/protocol"
-	ptypkg "github.com/spadeide/spade-agent/internal/pty"
 )
 
 // ServeRelaySession runs nested agent TLS over a relay byte pipe, then a
@@ -21,7 +15,8 @@ import (
 // length-prefixed JSON per stream, with an extra u8 stream_id on the wire.
 func (s *Server) ServeRelaySession(raw net.Conn) {
 	defer raw.Close()
-	_ = raw.SetDeadline(time.Now().Add(45 * time.Second))
+	// Match iPad nested-TLS budget; a hung peer must not pin dial slots long.
+	_ = raw.SetDeadline(time.Now().Add(20 * time.Second))
 
 	tlsCfg := s.Auth.SessionTLSConfig()
 	tlsConn := tls.Server(raw, tlsCfg)
@@ -46,48 +41,32 @@ func (s *Server) ServeRelaySession(raw net.Conn) {
 		log.Printf("relay auth failed: %v (peerCerts=%d)", err, peerN)
 		return
 	}
+	mux.UnlockFrames()
 
-	home, _ := os.UserHomeDir()
-	c := &client{
-		control: control,
-		rpc:     rpc,
-		ptyOut:  ptyStream,
-		device:  dev,
-		closed:  make(chan struct{}),
-	}
-	c.forceClose = func() { _ = mux.Close() }
-	c.fs = fsaccess.New(home, func(env protocol.Envelope) { c.send(env) })
-	c.pty = ptypkg.NewManager(platform.DefaultShell(), func(env protocol.Envelope) { c.send(env) })
+	s.runSession(dev, sessionWires{
+		control:    control,
+		rpc:        rpc,
+		ptyOut:     ptyStream,
+		forceClose: func() { _ = mux.Close() },
+		label:      "relay",
+	}, func(c *client) error {
+		errCh := make(chan error, 3)
+		go readStreamLoop(c, control, control, errCh)
+		go readStreamLoop(c, rpc, rpc, errCh)
+		go readStreamLoop(c, ptyStream, ptyStream, errCh)
 
-	s.mu.Lock()
-	s.clients[c] = struct{}{}
-	s.mu.Unlock()
-
-	defer func() {
-		c.shutdown()
-		c.pty.CloseAll()
-		c.fs.Close()
-		s.mu.Lock()
-		delete(s.clients, c)
-		s.mu.Unlock()
-		log.Printf("relay client disconnected: %s (%s)", dev.Name, dev.ID)
-	}()
-
-	log.Printf("relay client connected (mux): %s (%s)", dev.Name, dev.ID)
-	s.takeoverOtherSessions(dev.ID, c)
-
-	errCh := make(chan error, 3)
-	go readStreamLoop(c, control, control, errCh)
-	go readStreamLoop(c, rpc, rpc, errCh)
-	go readStreamLoop(c, ptyStream, ptyStream, errCh)
-
-	select {
-	case <-errCh:
-	case <-c.closed:
-	}
+		select {
+		case err := <-errCh:
+			return err
+		case <-c.closed:
+			return nil
+		}
+	})
 }
 
-// serveFramed is retained for tests / single-pipe debugging only.
+// serveFramed runs auth + runSession on a single length-prefixed pipe (no
+// stream mux). Used by tests as the simplest runSession entry point; also
+// handy for single-pipe debugging.
 func (s *Server) serveFramed(conn net.Conn, via string) {
 	defer conn.Close()
 
@@ -101,43 +80,23 @@ func (s *Server) serveFramed(conn net.Conn, via string) {
 		return
 	}
 
-	home, _ := os.UserHomeDir()
 	var writeMu sync.Mutex
 	fw := &lockedWriter{w: conn, mu: &writeMu}
-	c := &client{
-		control: fw,
-		rpc:     fw,
-		ptyOut:  fw,
-		device:  dev,
-		closed:  make(chan struct{}),
-	}
-	c.forceClose = func() { _ = conn.Close() }
-	c.fs = fsaccess.New(home, func(env protocol.Envelope) { c.send(env) })
-	c.pty = ptypkg.NewManager(platform.DefaultShell(), func(env protocol.Envelope) { c.send(env) })
-
-	s.mu.Lock()
-	s.clients[c] = struct{}{}
-	s.mu.Unlock()
-
-	defer func() {
-		c.shutdown()
-		c.pty.CloseAll()
-		c.fs.Close()
-		s.mu.Lock()
-		delete(s.clients, c)
-		s.mu.Unlock()
-		log.Printf("%s client disconnected: %s (%s)", via, dev.Name, dev.ID)
-	}()
-
-	log.Printf("%s client connected: %s (%s)", via, dev.Name, dev.ID)
-
-	for {
-		env, err := readFrame(conn)
-		if err != nil {
-			return
+	s.runSession(dev, sessionWires{
+		control:    fw,
+		rpc:        fw,
+		ptyOut:     fw,
+		forceClose: func() { _ = conn.Close() },
+		label:      via,
+	}, func(c *client) error {
+		for {
+			env, err := readFrame(conn)
+			if err != nil {
+				return err
+			}
+			c.dispatchInbound(env, fw)
 		}
-		c.dispatchInbound(env, fw)
-	}
+	})
 }
 
 type lockedWriter struct {

@@ -1,6 +1,8 @@
 package server
 
 import (
+	"encoding/binary"
+	"io"
 	"net"
 	"sync"
 	"testing"
@@ -105,5 +107,73 @@ func TestStreamMuxConcurrentStreams(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timeout waiting for pty frame")
+	}
+}
+
+func TestStreamMuxRejectsPreAuthHugeFrame(t *testing.T) {
+	a, b := net.Pipe()
+	defer a.Close()
+	defer b.Close()
+
+	server := newStreamMux(b)
+	done := make(chan struct{})
+	go func() {
+		server.Serve()
+		close(done)
+	}()
+	defer server.Close()
+
+	// 1 MiB declared — above MaxAuthFrameBytes, no UnlockFrames yet.
+	var hdr [5]byte
+	hdr[0] = StreamRPC
+	binary.BigEndian.PutUint32(hdr[1:5], 1<<20)
+	if _, err := a.Write(hdr[:]); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Serve did not exit on oversize pre-auth frame")
+	}
+	if server.readErr == nil {
+		t.Fatal("expected readErr")
+	}
+}
+
+func TestStreamMuxBufferCapBeforeUnlock(t *testing.T) {
+	a, b := net.Pipe()
+	defer a.Close()
+	defer b.Close()
+
+	server := newStreamMux(b)
+	done := make(chan struct{})
+	go func() {
+		server.Serve()
+		close(done)
+	}()
+	defer server.Close()
+
+	// Two MaxAuthFrameBytes frames into rpc without a reader → buffer overflow.
+	payload := make([]byte, MaxAuthFrameBytes)
+	for i := 0; i < 2; i++ {
+		var hdr [5]byte
+		hdr[0] = StreamRPC
+		binary.BigEndian.PutUint32(hdr[1:5], uint32(len(payload)))
+		if _, err := a.Write(hdr[:]); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := a.Write(payload); err != nil && err != io.ErrClosedPipe {
+			// second write may fail once Serve closed
+			if i == 0 {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Serve did not exit on buffer overflow")
 	}
 }

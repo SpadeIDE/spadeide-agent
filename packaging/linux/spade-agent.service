@@ -5,15 +5,19 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=spade
+User=root
+NoNewPrivileges=false
 ExecStart=/usr/local/bin/spadeide serve --foreground --port 7422 --control-port 7423
 Restart=on-failure
 RestartSec=3
-WorkingDirectory=/home/spade
-Environment=HOME=/home/spade
+WorkingDirectory=/var/lib/spade-agent
+Environment=HOME=/var/lib/spade-agent
+Environment=SPADE_AGENT_HOME=/var/lib/spade-agent
+Environment=SPADE_AGENT_MODE=system
 
-# Pairing and workspace roots live under ~/.spade-agent of this user.
-# Do not run as root — the iPad would get a root shell.
+# Privileged broker: pairing is still the QR; each tablet then Unix-logs in
+# once and is jailed to that account's $HOME. The PTY is that user, never root.
+# State (pairings, identity) lives in /var/lib/spade-agent — not /root.
 
 [Install]
 WantedBy=multi-user.target

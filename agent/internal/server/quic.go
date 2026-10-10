@@ -6,14 +6,9 @@ import (
 	"io"
 	"log"
 	"net"
-	"os"
 	"time"
 
 	"github.com/quic-go/quic-go"
-	fsaccess "github.com/spadeide/spade-agent/internal/fs"
-	"github.com/spadeide/spade-agent/internal/platform"
-	"github.com/spadeide/spade-agent/internal/protocol"
-	ptypkg "github.com/spadeide/spade-agent/internal/pty"
 )
 
 // listenQUIC serves SpadeIDE sessions over QUIC on UDP :Port (same number as WSS).
@@ -32,7 +27,7 @@ func (s *Server) listenQUIC(ctx context.Context) error {
 		tlsCfg,
 		&quic.Config{
 			MaxIdleTimeout:  5 * time.Minute,
-			KeepAlivePeriod: 20 * time.Second,
+			KeepAlivePeriod: 15 * time.Second,
 			Allow0RTT:       false,
 		},
 	)
@@ -91,45 +86,27 @@ func (s *Server) serveQUIC(conn *quic.Conn) {
 	log.Printf("quic streams ready control=%d rpc=%d pty=%d from %s",
 		control.StreamID(), rpc.StreamID(), ptyStream.StreamID(), conn.RemoteAddr())
 
-	home, _ := os.UserHomeDir()
-	c := &client{
-		control: control,
-		rpc:     rpc,
-		ptyOut:  ptyStream,
-		device:  dev,
-		closed:  make(chan struct{}),
-	}
-	c.forceClose = func() { _ = conn.CloseWithError(0, "unpaired") }
-	c.fs = fsaccess.New(home, func(env protocol.Envelope) { c.send(env) })
-	c.pty = ptypkg.NewManager(platform.DefaultShell(), func(env protocol.Envelope) { c.send(env) })
+	s.runSession(dev, sessionWires{
+		control:    control,
+		rpc:        rpc,
+		ptyOut:     ptyStream,
+		forceClose: func() { _ = conn.CloseWithError(0, "unpaired") },
+		label:      "quic",
+	}, func(c *client) error {
+		errCh := make(chan error, 3)
+		go readStreamLoop(c, control, control, errCh)
+		go readStreamLoop(c, rpc, rpc, errCh)
+		go readStreamLoop(c, ptyStream, ptyStream, errCh)
 
-	s.mu.Lock()
-	s.clients[c] = struct{}{}
-	s.mu.Unlock()
-
-	defer func() {
-		c.shutdown()
-		c.pty.CloseAll()
-		c.fs.Close()
-		s.mu.Lock()
-		delete(s.clients, c)
-		s.mu.Unlock()
-		log.Printf("quic client disconnected: %s (%s)", dev.Name, dev.ID)
-	}()
-
-	log.Printf("quic client connected: %s (%s)", dev.Name, dev.ID)
-	s.takeoverOtherSessions(dev.ID, c)
-
-	errCh := make(chan error, 3)
-	go readStreamLoop(c, control, control, errCh)
-	go readStreamLoop(c, rpc, rpc, errCh)
-	go readStreamLoop(c, ptyStream, ptyStream, errCh)
-
-	select {
-	case <-ctx.Done():
-	case <-errCh:
-	case <-c.closed:
-	}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case err := <-errCh:
+			return err
+		case <-c.closed:
+			return nil
+		}
+	})
 }
 
 // ServePunchQUIC listens for one QUIC client on an ephemeral punched UDP socket
@@ -144,7 +121,7 @@ func (s *Server) ServePunchQUIC(ctx context.Context, pc net.PacketConn) {
 
 	ln, err := tr.Listen(tlsCfg, &quic.Config{
 		MaxIdleTimeout:  5 * time.Minute,
-		KeepAlivePeriod: 20 * time.Second,
+		KeepAlivePeriod: 15 * time.Second,
 		Allow0RTT:       false,
 	})
 	if err != nil {

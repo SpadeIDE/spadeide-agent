@@ -5,16 +5,22 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=spade
+User=root
+NoNewPrivileges=false
 ExecStart=/usr/bin/spadeide serve --foreground --port 7422 --control-port 7423
 Restart=on-failure
 RestartSec=3
-WorkingDirectory=/home/spade
-Environment=HOME=/home/spade
+WorkingDirectory=/var/lib/spade-agent
+Environment=HOME=/var/lib/spade-agent
+Environment=SPADE_AGENT_HOME=/var/lib/spade-agent
+Environment=SPADE_AGENT_MODE=system
 
-# Disabled by default. For a dedicated server account:
-#   sudo useradd --create-home --shell /bin/bash spade
+# Disabled by default. The .deb enables the *user* unit for the installing
+# desktop account. Enable this system unit only for a shared Linux host:
+#   sudo mkdir -p /var/lib/spade-agent
+#   sudo chmod 700 /var/lib/spade-agent
 #   sudo systemctl enable --now spade-agent
+# That is a privileged broker (risky). Each iPad Unix-logs in once.
 
 [Install]
 WantedBy=multi-user.target
