@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/base64"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -84,6 +85,86 @@ func TestEnsureRvSecretIdempotent(t *testing.T) {
 	}
 	if string(a) != string(b) {
 		t.Fatal("EnsureRvSecret minted a second secret")
+	}
+}
+
+func TestPerDeviceRvSecretUnpairIndependent(t *testing.T) {
+	store, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertDevice(Device{ID: "a", Name: "A"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertDevice(Device{ID: "b", Name: "B"}); err != nil {
+		t.Fatal(err)
+	}
+	sa, err := store.EnsureDeviceRvSecret("a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sb, err := store.EnsureDeviceRvSecret("b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sa == "" || sb == "" || sa == sb {
+		t.Fatalf("secrets should differ: %q %q", sa, sb)
+	}
+	again, err := store.EnsureDeviceRvSecret("a")
+	if err != nil || again != sa {
+		t.Fatalf("re-ensure rotated secret: %q vs %q (%v)", again, sa, err)
+	}
+	if _, err := store.RemoveDevice("a"); err != nil {
+		t.Fatal(err)
+	}
+	secrets, err := store.AllDeviceRvSecrets()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(secrets) != 1 {
+		t.Fatalf("after unpair A: secrets=%d", len(secrets))
+	}
+	devB, err := store.FindDeviceByID("b")
+	if err != nil || devB.RvSecret != sb {
+		t.Fatalf("B secret lost: %+v %v", devB, err)
+	}
+}
+
+func TestMigrateLegacyRvSecrets(t *testing.T) {
+	store, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy, err := store.EnsureRvSecret()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertDevice(Device{ID: "old", Name: "Old"}); err != nil {
+		t.Fatal(err)
+	}
+	n, err := store.MigrateLegacyRvSecrets()
+	if err != nil || n != 1 {
+		t.Fatalf("n=%d err=%v", n, err)
+	}
+	dev, err := store.FindDeviceByID("old")
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := decodeRvSecret(dev.RvSecret)
+	if err != nil || string(raw) != string(legacy) {
+		t.Fatalf("migrated=%q legacy=%q err=%v", dev.RvSecret, legacy, err)
+	}
+	n, err = store.MigrateLegacyRvSecrets()
+	if err != nil || n != 0 {
+		t.Fatalf("second migrate n=%d err=%v", n, err)
+	}
+	// Next pair upgrades the shared legacy copy to a unique secret.
+	upgraded, err := store.EnsureDeviceRvSecret("old")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if upgraded == "" || upgraded == base64.StdEncoding.EncodeToString(legacy) {
+		t.Fatalf("expected unique upgrade, got %q", upgraded)
 	}
 }
 

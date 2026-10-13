@@ -6,16 +6,16 @@ Host agent for [SpadeIDE](https://github.com/SpadeIDE) — the Go daemon that th
 
 ## Documentation
 
-End-user install, CLI, ports, and remote access live on the product site (paths match the `spadeide-site` repo — swap the host if you self-host the docs):
+End-user install, CLI, ports, and remote access live on the product site:
 
 | Topic | URL |
 |---|---|
-| Docs hub | https://spadeide.com/docs/ |
-| Linux agent | https://spadeide.com/docs/agent-linux.html |
-| macOS agent | https://spadeide.com/docs/agent-macos.html |
-| Downloads | https://spadeide.com/download.html |
+| Docs hub | https://www.spadeide.com/docs/ |
+| Linux agent | https://www.spadeide.com/docs/agent-linux.html |
+| macOS agent | https://www.spadeide.com/docs/agent-macos.html |
+| Downloads | https://www.spadeide.com/download.html |
 
-> **Note:** the public site is not deployed yet — update the host above when it is. Until then use the HTML in the `spadeide-site` repo (`docs/`), or the in-repo guides below.
+Prefer the `www` host (apex redirects there). In-repo guides are below if you want sources next to the code.
 
 In this repo:
 
@@ -54,7 +54,7 @@ shasum -a 256 -c SHA256SUMS.txt
 3. Grant folder access when asked (once per signing identity).
 4. Scan the QR from the menu-bar window with the iPad app.
 
-Optional: enable **Open at Login** in the agent window. Details: [docs site → macOS](https://spadeide.com/docs/agent-macos.html) · [docs/MAC_DMG.md](docs/MAC_DMG.md).
+Optional: enable **Open at Login** in the agent window. Details: [docs site → macOS](https://www.spadeide.com/docs/agent-macos.html) · [docs/MAC_DMG.md](docs/MAC_DMG.md).
 
 ### Linux — Ubuntu / Debian desktop (`.deb`)
 
@@ -135,7 +135,7 @@ spadeide status               # Linux CLI
 # or check the tray / menu-bar window
 ```
 
-Re-pair only if you wiped identity (`~/.spade-agent` / `/var/lib/spade-agent` on Linux, or reset the Mac app). Remote access: pair once so the iPad has an `rvSecret`, then `spadeide remote on` (or the tray toggle).
+Re-pair only if you wiped identity (`~/.spade-agent` / `/var/lib/spade-agent` on Linux, or reset the Mac app). Remote access: pair once so the iPad gets its own `rvSecret`, then `spadeide remote on` (or the tray toggle). Unpairing one tablet drops only that tablet’s remote handle — others keep working. After upgrading from a host-wide secret, pair each tablet once so it receives a unique secret.
 
 ## Day-to-day (Linux CLI)
 

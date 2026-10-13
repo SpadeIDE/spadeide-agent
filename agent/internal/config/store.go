@@ -39,6 +39,9 @@ type Device struct {
 	Name      string `json:"name"`
 	DevicePub string `json:"devicePub,omitempty"` // base64 SPKI (P-256) — session auth
 	CreatedAt int64  `json:"createdAt"`
+	// RvSecret is this tablet's durable 32-byte blinded-rendezvous key (base64).
+	// Per-device: unpair drops only this secret; other tablets keep working.
+	RvSecret string `json:"rvSecret,omitempty"`
 	// UnixUser is the host account this tablet is bound to (system mode).
 	UnixUser string `json:"unixUser,omitempty"`
 	// UnixUID is the uid recorded at bind. Recreated accounts with the same
@@ -53,8 +56,8 @@ type State struct {
 	Devices      []Device `json:"devices"`
 	RemoteAccess bool     `json:"remoteAccess"`           // default false — never dial rendezvous when off
 	RemoteServer string   `json:"remoteServer,omitempty"` // wss://… override; empty = product default later
-	// RvSecret is a durable 32-byte key (base64) shared with paired iPads for
-	// blinded rendezvous handles. Distinct from the ephemeral QR pair secret.
+	// RvSecret is the legacy host-level blind key (base64). Kept for migration
+	// onto per-device secrets; new pairs mint Device.RvSecret instead.
 	RvSecret string `json:"rvSecret,omitempty"`
 }
 
@@ -434,23 +437,43 @@ func (s *Store) RemoteAccess() (enabled bool, server string, err error) {
 	return enabled, server, err
 }
 
-// EnsureRvSecret mints a 32-byte rendezvous secret if missing and returns raw bytes.
+func decodeRvSecret(b64 string) ([]byte, error) {
+	if b64 == "" {
+		return nil, nil
+	}
+	decoded, err := base64.StdEncoding.DecodeString(b64)
+	if err != nil || len(decoded) != 32 {
+		return nil, fmt.Errorf("corrupt rvSecret")
+	}
+	return decoded, nil
+}
+
+func mintRvSecretB64() (string, []byte, error) {
+	raw := make([]byte, 32)
+	if _, err := rand.Read(raw); err != nil {
+		return "", nil, err
+	}
+	return base64.StdEncoding.EncodeToString(raw), raw, nil
+}
+
+// EnsureRvSecret mints a legacy host-level secret if missing (migration only).
 func (s *Store) EnsureRvSecret() ([]byte, error) {
 	var raw []byte
 	err := s.update(func(st *State) error {
 		if st.RvSecret != "" {
-			decoded, err := base64.StdEncoding.DecodeString(st.RvSecret)
-			if err != nil || len(decoded) != 32 {
-				return fmt.Errorf("corrupt rvSecret")
+			decoded, err := decodeRvSecret(st.RvSecret)
+			if err != nil {
+				return err
 			}
 			raw = decoded
 			return errSkipPersist
 		}
-		raw = make([]byte, 32)
-		if _, err := rand.Read(raw); err != nil {
+		b64, decoded, err := mintRvSecretB64()
+		if err != nil {
 			return err
 		}
-		st.RvSecret = base64.StdEncoding.EncodeToString(raw)
+		st.RvSecret = b64
+		raw = decoded
 		return nil
 	})
 	if errors.Is(err, errSkipPersist) {
@@ -459,17 +482,14 @@ func (s *Store) EnsureRvSecret() ([]byte, error) {
 	return raw, err
 }
 
-// RvSecretBytes returns the raw secret, or nil if none yet.
+// RvSecretBytes returns the legacy host-level secret, or nil if none.
 func (s *Store) RvSecretBytes() ([]byte, error) {
 	var raw []byte
 	var corrupt error
 	err := s.view(func(st *State) {
-		if st.RvSecret == "" {
-			return
-		}
-		decoded, e := base64.StdEncoding.DecodeString(st.RvSecret)
-		if e != nil || len(decoded) != 32 {
-			corrupt = fmt.Errorf("corrupt rvSecret")
+		decoded, e := decodeRvSecret(st.RvSecret)
+		if e != nil {
+			corrupt = e
 			return
 		}
 		raw = decoded
@@ -483,11 +503,111 @@ func (s *Store) RvSecretBytes() ([]byte, error) {
 	return raw, nil
 }
 
-// RvSecretBase64 returns the wire encoding, or empty if none.
+// RvSecretBase64 returns the legacy host-level wire encoding, or empty if none.
 func (s *Store) RvSecretBase64() (string, error) {
 	var out string
 	err := s.view(func(st *State) {
 		out = st.RvSecret
 	})
 	return out, err
+}
+
+// EnsureDeviceRvSecret returns this device's rvSecret, minting one if missing.
+// If the device still holds a copy of the legacy host-level secret (shared with
+// every tablet after MigrateLegacyRvSecrets), mint a unique replacement so a
+// later unpair cannot leave that tablet able to derive other devices' rids.
+func (s *Store) EnsureDeviceRvSecret(deviceID string) (string, error) {
+	var out string
+	err := s.update(func(st *State) error {
+		for i := range st.Devices {
+			if st.Devices[i].ID != deviceID {
+				continue
+			}
+			cur := st.Devices[i].RvSecret
+			if cur != "" {
+				if _, err := decodeRvSecret(cur); err != nil {
+					return err
+				}
+				// Shared legacy copy → upgrade to unique on pair/re-pair.
+				if st.RvSecret != "" && cur == st.RvSecret {
+					b64, _, err := mintRvSecretB64()
+					if err != nil {
+						return err
+					}
+					st.Devices[i].RvSecret = b64
+					out = b64
+					return nil
+				}
+				out = cur
+				return errSkipPersist
+			}
+			b64, _, err := mintRvSecretB64()
+			if err != nil {
+				return err
+			}
+			st.Devices[i].RvSecret = b64
+			out = b64
+			return nil
+		}
+		return fmt.Errorf("device not found")
+	})
+	if errors.Is(err, errSkipPersist) {
+		return out, nil
+	}
+	return out, err
+}
+
+// MigrateLegacyRvSecrets copies the host-level RvSecret onto any paired device
+// that still lacks its own. Safe to call on every start.
+func (s *Store) MigrateLegacyRvSecrets() (int, error) {
+	var n int
+	err := s.update(func(st *State) error {
+		if st.RvSecret == "" {
+			return errSkipPersist
+		}
+		if _, err := decodeRvSecret(st.RvSecret); err != nil {
+			return err
+		}
+		for i := range st.Devices {
+			if st.Devices[i].RvSecret != "" {
+				continue
+			}
+			st.Devices[i].RvSecret = st.RvSecret
+			n++
+		}
+		if n == 0 {
+			return errSkipPersist
+		}
+		return nil
+	})
+	if errors.Is(err, errSkipPersist) {
+		return 0, nil
+	}
+	return n, err
+}
+
+// AllDeviceRvSecrets returns raw 32-byte secrets for every paired device that
+// has one. Used to advertise all current rids on the rendezvous registration.
+func (s *Store) AllDeviceRvSecrets() ([][]byte, error) {
+	var out [][]byte
+	var corrupt error
+	err := s.view(func(st *State) {
+		for i := range st.Devices {
+			raw, e := decodeRvSecret(st.Devices[i].RvSecret)
+			if e != nil {
+				corrupt = e
+				return
+			}
+			if len(raw) == 32 {
+				out = append(out, raw)
+			}
+		}
+	})
+	if err != nil {
+		return nil, err
+	}
+	if corrupt != nil {
+		return nil, corrupt
+	}
+	return out, nil
 }

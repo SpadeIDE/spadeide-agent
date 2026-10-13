@@ -119,18 +119,31 @@ func runServe(port, controlPort int) error {
 		DialTimeout: 60 * time.Second,
 		PunchWindow: 15 * time.Second,
 	}
+	if n, err := store.MigrateLegacyRvSecrets(); err != nil {
+		log.Printf("rendezvous: migrate rvSecret: %v", err)
+	} else if n > 0 {
+		log.Printf("rendezvous: migrated host rvSecret onto %d device(s)", n)
+	}
 	rv := &rendezvous.Dialer{
 		Identity:           id,
 		MaxOffersPerMinute: 12,
-		RvSecret: func() []byte {
-			raw, err := store.EnsureRvSecret()
+		RvSecrets: func() [][]byte {
+			secrets, err := store.AllDeviceRvSecrets()
 			if err != nil {
 				return nil
 			}
-			return raw
+			return secrets
 		},
 		OnOffer: offers.Handle,
 	}
+	refreshRV := func() {
+		on, srvURL, err := store.RemoteAccess()
+		if err != nil || !on {
+			return
+		}
+		rv.Apply(true, srvURL)
+	}
+	srv.OnDevicesChanged = refreshRV
 	ctrl.Remote = rv
 	if on, srvURL, err := store.RemoteAccess(); err == nil && on {
 		rv.Apply(true, srvURL)

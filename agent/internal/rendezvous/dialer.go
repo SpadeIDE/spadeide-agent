@@ -19,11 +19,18 @@ import (
 
 var errEpochRefresh = errors.New("epoch refresh")
 
+// errSlotTaken is returned when A1 refuses our register because the previous
+// websocket has not been swept yet (Apply tore down and raced a new dial).
+var errSlotTaken = errors.New("slot taken")
+
 // Dialer keeps a registration WebSocket to the rendezvous while remote access is on.
 type Dialer struct {
 	Identity *identity.Agent
-	// RvSecret returns the durable blinded-handle key (32 bytes), or nil/empty
-	// to register aid-only (legacy pairings).
+	// RvSecrets returns every paired device's durable blind key (32 bytes each).
+	// The agent registers the current-epoch rid for each so unpair of one tablet
+	// only drops that tablet's handle. Empty → aid-only (legacy).
+	RvSecrets func() [][]byte
+	// RvSecret is the legacy single-secret hook. Used only when RvSecrets is nil.
 	RvSecret func() []byte
 	// OnOffer is called with the agent relay ticket when a client looks us up.
 	// Offer.Punch is an optional ephemeral UDP socket already mapped via reflex
@@ -122,6 +129,16 @@ func (d *Dialer) loop(ctx context.Context, srv ServerURL, gen uint64) {
 			backoff = time.Second
 			continue
 		}
+		if errors.Is(err, errSlotTaken) {
+			// Previous session still holds the rid for a moment after Apply.
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(time.Second):
+			}
+			backoff = time.Second
+			continue
+		}
 		// Retry-After applies to this wait only — never stick it into backoff.
 		wait := backoff
 		var ra *retryAfterError
@@ -140,6 +157,39 @@ func (d *Dialer) loop(ctx context.Context, srv ServerURL, gen uint64) {
 			backoff *= 2
 		}
 	}
+}
+
+func (d *Dialer) collectSecrets() [][]byte {
+	if d.RvSecrets != nil {
+		return d.RvSecrets()
+	}
+	if d.RvSecret == nil {
+		return nil
+	}
+	raw := d.RvSecret()
+	if len(raw) != 32 {
+		return nil
+	}
+	return [][]byte{raw}
+}
+
+// mergeRIDs unions CurrentRIDs for every secret (deduped, stable order).
+func mergeRIDs(secrets [][]byte, now time.Time) []string {
+	seen := make(map[string]struct{}, len(secrets)*2)
+	out := make([]string, 0, len(secrets)*2)
+	for _, secret := range secrets {
+		if len(secret) != 32 {
+			continue
+		}
+		for _, rid := range CurrentRIDs(secret, now) {
+			if _, ok := seen[rid]; ok {
+				continue
+			}
+			seen[rid] = struct{}{}
+			out = append(out, rid)
+		}
+	}
+	return out
 }
 
 func (d *Dialer) session(ctx context.Context, srv ServerURL, gen uint64) (ready bool, err error) {
@@ -162,13 +212,9 @@ func (d *Dialer) session(ctx context.Context, srv ServerURL, gen uint64) (ready 
 	defer conn.Close()
 
 	hello := envelope{"t": "hello", "aid": d.Identity.ID, "proto": 1}
-	var secret []byte
-	if d.RvSecret != nil {
-		secret = d.RvSecret()
-	}
-	if len(secret) == 32 {
-		rids := CurrentRIDs(secret, time.Now())
-		hello["rids"] = rids
+	secrets := d.collectSecrets()
+	if len(secrets) > 0 {
+		hello["rids"] = mergeRIDs(secrets, time.Now())
 		hello["proto"] = 2
 	}
 	if err := conn.WriteJSON(hello); err != nil {
@@ -191,8 +237,10 @@ func (d *Dialer) session(ctx context.Context, srv ServerURL, gen uint64) (ready 
 		"pub": d.Identity.PublicBase64(),
 		"sig": base64.StdEncoding.EncodeToString(d.Identity.Sign(nonce)),
 	}
-	if len(secret) == 32 {
-		prove["mac"] = base64.StdEncoding.EncodeToString(ProveMAC(secret, nonce))
+	// Registration auth is Ed25519 (aid/pub/sig). MAC is a format gate when
+	// advertising rids — server cannot verify without rvSecret.
+	if len(secrets) > 0 {
+		prove["mac"] = base64.StdEncoding.EncodeToString(ProveMAC(secrets[0], nonce))
 	}
 	if err := conn.WriteJSON(prove); err != nil {
 		return false, err
@@ -202,6 +250,9 @@ func (d *Dialer) session(ctx context.Context, srv ServerURL, gen uint64) (ready 
 	}
 	if msg["t"] != "ready" {
 		if msg["t"] == "error" {
+			if msg["msg"] == "slot taken" {
+				return false, errSlotTaken
+			}
 			return false, fmt.Errorf("rendezvous: %v", msg["msg"])
 		}
 		return false, fmt.Errorf("expected ready, got %v", msg["t"])
@@ -212,8 +263,8 @@ func (d *Dialer) session(ctx context.Context, srv ServerURL, gen uint64) (ready 
 	}
 	d.mu.Unlock()
 	ready = true
-	if len(secret) == 32 {
-		log.Printf("rendezvous: registered at %s (aid+rid)", srv)
+	if len(secrets) > 0 {
+		log.Printf("rendezvous: registered at %s (aid+%d rid sets)", srv, len(secrets))
 	} else {
 		log.Printf("rendezvous: registered at %s (aid)", srv)
 	}

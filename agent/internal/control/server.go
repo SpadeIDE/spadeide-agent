@@ -207,6 +207,7 @@ func (s *Server) handleReset(w http.ResponseWriter, r *http.Request) {
 	}
 	s.Agent.DisconnectAll()
 	s.Auth.RotatePairSecret()
+	s.notifyDevicesChanged()
 	httpx.WriteJSON(w, s.snapshot())
 }
 
@@ -227,7 +228,22 @@ func (s *Server) handleDevice(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.Agent.DisconnectDevice(id)
+	s.notifyDevicesChanged()
 	httpx.WriteJSON(w, s.snapshot())
+}
+
+// notifyDevicesChanged re-registers with rendezvous after the paired-device set
+// changes. Prefers Agent.OnDevicesChanged (wired in serve.go); falls back to
+// Remote.Apply when the hook is unset (tests / alternate hosts).
+func (s *Server) notifyDevicesChanged() {
+	if s.Agent != nil && s.Agent.OnDevicesChanged != nil {
+		s.Agent.OnDevicesChanged()
+		return
+	}
+	if s.Remote != nil && s.Store != nil {
+		on, srv, _ := s.Store.RemoteAccess()
+		s.Remote.Apply(on, srv)
+	}
 }
 
 type remoteBody struct {

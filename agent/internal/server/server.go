@@ -46,6 +46,10 @@ type Server struct {
 	Host     string
 	LocalIP  string
 
+	// OnDevicesChanged fires when the paired-device set changes (pair, unpair,
+	// reset) so the rendezvous dialer can re-advertise per-device rids. Optional.
+	OnDevicesChanged func()
+
 	pairLimit  *ratelimit.Limiter
 	loginLimit *ratelimit.Limiter
 
@@ -352,11 +356,13 @@ func (s *Server) handlePair(w http.ResponseWriter, r *http.Request) {
 		resp.AgentPub = s.Identity.PublicBase64()
 	}
 	if s.Store != nil {
-		if _, err := s.Store.EnsureRvSecret(); err == nil {
-			if b64, err := s.Store.RvSecretBase64(); err == nil {
-				resp.RvSecret = b64
-			}
+		// Per-device secret: mint once per tablet; re-pair keeps the same value.
+		if b64, err := s.Store.EnsureDeviceRvSecret(req.DeviceID); err == nil {
+			resp.RvSecret = b64
 		}
+	}
+	if s.OnDevicesChanged != nil {
+		s.OnDevicesChanged()
 	}
 	httpx.WriteJSON(w, resp)
 }

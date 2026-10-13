@@ -42,6 +42,27 @@ func TestCurrentRIDsLen(t *testing.T) {
 	}
 }
 
+func TestMergeRIDsTwoDevices(t *testing.T) {
+	a := make([]byte, 32)
+	b := make([]byte, 32)
+	for i := range a {
+		a[i] = byte(i + 1)
+		b[i] = byte(100 + i)
+	}
+	now := time.Unix(1_700_000_000, 0)
+	rids := mergeRIDs([][]byte{a, b}, now)
+	if len(rids) != 4 {
+		t.Fatalf("want 4 rids, got %v", rids)
+	}
+	seen := map[string]bool{}
+	for _, r := range rids {
+		if seen[r] {
+			t.Fatalf("dup %s", r)
+		}
+		seen[r] = true
+	}
+}
+
 func TestRIDGoldenVector(t *testing.T) {
 	// Fixed vector shared with iOS BlindRendezvous (do not change).
 	secret := make([]byte, 32)

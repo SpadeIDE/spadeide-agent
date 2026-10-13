@@ -343,8 +343,8 @@ type PairResponse struct {
 	Fingerprint string `json:"fingerprint"`
 	AgentID     string `json:"agentId,omitempty"`
 	AgentPub    string `json:"agentPub,omitempty"` // base64 raw Ed25519
-	// RvSecret is the durable blinded-rendezvous key (base64, 32 bytes).
-	// Returned once per successful pair; store in Keychain on the iPad.
+	// RvSecret is this device's durable blinded-rendezvous key (base64, 32 bytes).
+	// Returned on pair; store in Keychain on the iPad. Unique per tablet.
 	RvSecret string `json:"rvSecret,omitempty"`
 }
 

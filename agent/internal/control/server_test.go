@@ -253,3 +253,78 @@ func TestHandleRemoteRejectsInvalidServerURL(t *testing.T) {
 		t.Fatalf("store mutated on bad URL: on=%v srv=%q", on, srv)
 	}
 }
+
+type applyProbe struct {
+	n       int
+	enabled bool
+	server  string
+}
+
+func (p *applyProbe) Apply(enabled bool, server string) {
+	p.n++
+	p.enabled = enabled
+	p.server = server
+}
+
+func (p *applyProbe) State() (bool, string, bool) {
+	return p.enabled, p.server, false
+}
+
+func TestUnpairAndResetRefreshRendezvous(t *testing.T) {
+	store, err := config.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetRemoteAccess(true, "wss://rv.example"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertDevice(config.Device{ID: "dev-a", Name: "A"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertDevice(config.Device{ID: "dev-b", Name: "B"}); err != nil {
+		t.Fatal(err)
+	}
+	authMgr, err := auth.NewManager(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := identity.LoadOrCreate(store.Dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	agent := server.New(0, store, authMgr, id)
+	probe := &applyProbe{}
+	// Same wiring as serve.go: hook → Remote.Apply.
+	agent.OnDevicesChanged = func() {
+		on, srv, err := store.RemoteAccess()
+		if err != nil || !on {
+			return
+		}
+		probe.Apply(on, srv)
+	}
+	s := New(0, store, authMgr, agent)
+	s.Remote = probe
+	s.token = "secret-token"
+
+	del := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodDelete, "/v1/pair/devices/dev-a", nil)
+	req.Header.Set("Authorization", "Bearer secret-token")
+	s.guard(s.handleDevice)(del, req)
+	if del.Code != http.StatusOK {
+		t.Fatalf("unpair status=%d body=%s", del.Code, del.Body.String())
+	}
+	if probe.n != 1 || !probe.enabled || probe.server != "wss://rv.example" {
+		t.Fatalf("unpair refresh: %+v", probe)
+	}
+
+	reset := httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPost, "/v1/pair/reset", nil)
+	req.Header.Set("Authorization", "Bearer secret-token")
+	s.guard(s.handleReset)(reset, req)
+	if reset.Code != http.StatusOK {
+		t.Fatalf("reset status=%d body=%s", reset.Code, reset.Body.String())
+	}
+	if probe.n != 2 {
+		t.Fatalf("reset should refresh again: n=%d", probe.n)
+	}
+}

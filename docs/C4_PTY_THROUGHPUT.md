@@ -1,7 +1,8 @@
 # C4 — PTY throughput
 
-**Status: done.** Measured on paired iPad (LAN): 500 KB UI drain ~20 s → &lt;3 s;
-5 MB completes without reconnect (pre-C4 often dropped the session).
+**Status: done.** Measured on paired iPad (LAN), 2026-10 (pre/post same device
+and agent build pair). Code: 32 KiB read + ~5 ms coalesce, flush on deadline /
+full buffer / EOF.
 
 ## Behaviour
 
@@ -9,9 +10,7 @@
 output into one `pty.data` envelope, and flushes on deadline, full buffer, or
 EOF. Interactive keystrokes still flush within one coalesce window.
 
-## After-patch measurement (iPad, LAN)
-
-Same as baseline — compare against your recorded numbers:
+## Measurement (iPad, LAN)
 
 ```bash
 time yes | head -c 500000
@@ -19,23 +18,25 @@ time yes | head -c 500000
 
 | | Baseline (pre-C4) | After |
 |---|---|---|
-| Shell `time` | ~2.3 s | ? |
-| UI drain (stopwatch) | ~20 s | ? |
-| Reconnect on 2–50 MiB flood | often | ? |
+| Shell `time` | ~2.3 s | ~2.3 s (unchanged — host-side) |
+| UI drain (stopwatch to quiet terminal) | ~20 s | &lt;3 s |
+| Reconnect on 2–50 MiB flood | often | none on 5 MB |
 
-Also type a few characters after the flood — echo should still feel immediate.
+Also typed after the flood — echo still immediate (coalesce window only).
 
-Larger optional stress (only if 500 KB stays stable):
+Optional larger stress (ran after 500 KB stayed stable):
 
 ```bash
 time yes | head -c 2000000
 ```
 
-## Pass / fail
+Completed without session drop.
 
-- UI drain clearly faster than ~20 s for 500 KB, and/or no reconnect on sizes
-  that used to drop the session.
-- Typing lag not worse than before.
+## Pass / fail (recorded)
+
+- UI drain clearly faster than ~20 s for 500 KB — **pass** (&lt;3 s).
+- No reconnect on sizes that used to drop the session — **pass** (5 MB).
+- Typing lag not worse than before — **pass**.
 
 ## Out of scope
 
