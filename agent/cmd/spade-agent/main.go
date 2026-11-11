@@ -75,7 +75,7 @@ func printUsage() {
   spadeide status              paired / online tablets (no new QR)
   spadeide devices             list paired tablets
   spadeide unpair <id|name>    remove one paired tablet
-  spadeide remote on|off       allow / deny internet reachability (default off)
+  spadeide remote on|off       allow / deny internet reachability (default on)
   spadeide remote status       show remote-access setting
   spadeide stop                stop the background agent
   spadeide serve --foreground  stay attached (for systemd)

@@ -124,6 +124,11 @@ func runServe(port, controlPort int) error {
 	} else if n > 0 {
 		log.Printf("rendezvous: migrated host rvSecret onto %d device(s)", n)
 	}
+	if flipped, err := store.MigrateRemoteAccessDefaultOn(); err != nil {
+		log.Printf("remote: migrate default on: %v", err)
+	} else if flipped {
+		log.Printf("remote: default is now on (was off) — `spadeide remote off` to disable")
+	}
 	rv := &rendezvous.Dialer{
 		Identity:           id,
 		MaxOffersPerMinute: 12,

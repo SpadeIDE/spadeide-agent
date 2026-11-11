@@ -300,6 +300,63 @@ func TestRemoveDeviceMissing(t *testing.T) {
 	}
 }
 
+func TestRemoteAccessDefaultsOn(t *testing.T) {
+	store, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	on, _, err := store.RemoteAccess()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !on {
+		t.Fatal("fresh install should default remote access on")
+	}
+}
+
+func TestMigrateRemoteAccessDefaultOn(t *testing.T) {
+	dir := t.TempDir()
+	store, err := NewStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Simulate a pre-migration install that still has the old default (off).
+	if err := store.SaveState(&State{RemoteAccess: false}); err != nil {
+		t.Fatal(err)
+	}
+	other, err := NewStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	flipped, err := other.MigrateRemoteAccessDefaultOn()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !flipped {
+		t.Fatal("expected flip from off → on")
+	}
+	on, _, err := other.RemoteAccess()
+	if err != nil || !on {
+		t.Fatalf("on=%v err=%v", on, err)
+	}
+	flipped, err = other.MigrateRemoteAccessDefaultOn()
+	if err != nil || flipped {
+		t.Fatalf("second migrate should no-op: flipped=%v err=%v", flipped, err)
+	}
+	off := false
+	if err := other.UpdateRemoteAccess(&off, nil); err != nil {
+		t.Fatal(err)
+	}
+	flipped, err = other.MigrateRemoteAccessDefaultOn()
+	if err != nil || flipped {
+		t.Fatalf("explicit off must stick: flipped=%v err=%v", flipped, err)
+	}
+	on, _, err = other.RemoteAccess()
+	if err != nil || on {
+		t.Fatalf("want off after explicit disable, on=%v err=%v", on, err)
+	}
+}
+
 func TestCacheReloadsWhenDiskChanges(t *testing.T) {
 	dir := t.TempDir()
 	store, err := NewStore(dir)

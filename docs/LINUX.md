@@ -50,8 +50,8 @@ spadeide desktop      # tray + window (needs the .deb)
 spadeide status       # paired / online (no new QR)
 spadeide devices      # list tablets
 spadeide unpair NAME  # remove one tablet (id prefix or name)
-spadeide remote off   # default — never dial the internet introducer
-spadeide remote on    # allow internet reachability when rendezvous is wired
+spadeide remote on    # default — register with the internet introducer
+spadeide remote off   # never dial the introducer (LAN-only)
 spadeide stop
 ```
 

@@ -135,7 +135,7 @@ spadeide status               # Linux CLI
 # or check the tray / menu-bar window
 ```
 
-Re-pair only if you wiped identity (`~/.spade-agent` / `/var/lib/spade-agent` on Linux, or reset the Mac app). Remote access: pair once so the iPad gets its own `rvSecret`, then `spadeide remote on` (or the tray toggle). Unpairing one tablet drops only that tablet’s remote handle — others keep working. After upgrading from a host-wide secret, pair each tablet once so it receives a unique secret.
+Re-pair only if you wiped identity (`~/.spade-agent` / `/var/lib/spade-agent` on Linux, or reset the Mac app). Remote access is **on by default** after install/upgrade (tray toggle or `spadeide remote off` to disable). Pair once so the iPad gets its own `rvSecret`. Unpairing one tablet drops only that tablet’s remote handle — others keep working. After upgrading from a host-wide secret, pair each tablet once so it receives a unique secret.
 
 ## Day-to-day (Linux CLI)
 

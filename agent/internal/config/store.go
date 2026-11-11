@@ -54,11 +54,22 @@ type Device struct {
 
 type State struct {
 	Devices      []Device `json:"devices"`
-	RemoteAccess bool     `json:"remoteAccess"`           // default false — never dial rendezvous when off
+	RemoteAccess bool     `json:"remoteAccess"`           // default true — register with rendezvous unless turned off
 	RemoteServer string   `json:"remoteServer,omitempty"` // wss://… override; empty = product default later
+	// RemoteDefaultOnApplied marks the one-shot migration that flipped the old
+	// default (off) to on. After this, an explicit `remote off` stays off.
+	RemoteDefaultOnApplied bool `json:"remoteDefaultOnApplied,omitempty"`
 	// RvSecret is the legacy host-level blind key (base64). Kept for migration
 	// onto per-device secrets; new pairs mint Device.RvSecret instead.
 	RvSecret string `json:"rvSecret,omitempty"`
+}
+
+// defaultState is used when state.json is missing (fresh install).
+func defaultState() *State {
+	return &State{
+		RemoteAccess:           true,
+		RemoteDefaultOnApplied: true,
+	}
 }
 
 func DefaultDir() (string, error) {
@@ -159,7 +170,7 @@ func cloneState(st *State) *State {
 func (s *Store) loadFromDisk() (*State, error) {
 	data, err := os.ReadFile(s.StatePath())
 	if errors.Is(err, os.ErrNotExist) {
-		return &State{}, nil
+		return defaultState(), nil
 	}
 	if err != nil {
 		return nil, err
@@ -412,6 +423,8 @@ func (s *Store) SetRemoteAccess(enabled bool, server string) error {
 	return s.update(func(st *State) error {
 		st.RemoteAccess = enabled
 		st.RemoteServer = strings.TrimSpace(server)
+		// Explicit CLI/tray choice — do not re-flip on the default-on migration.
+		st.RemoteDefaultOnApplied = true
 		return nil
 	})
 }
@@ -421,6 +434,7 @@ func (s *Store) UpdateRemoteAccess(enabled *bool, server *string) error {
 	return s.update(func(st *State) error {
 		if enabled != nil {
 			st.RemoteAccess = *enabled
+			st.RemoteDefaultOnApplied = true
 		}
 		if server != nil {
 			st.RemoteServer = strings.TrimSpace(*server)
@@ -435,6 +449,24 @@ func (s *Store) RemoteAccess() (enabled bool, server string, err error) {
 		server = st.RemoteServer
 	})
 	return enabled, server, err
+}
+
+// MigrateRemoteAccessDefaultOn flips installs that still carry the old default
+// (remote off) to on, once. Fresh installs already start on via defaultState.
+func (s *Store) MigrateRemoteAccessDefaultOn() (flipped bool, err error) {
+	err = s.update(func(st *State) error {
+		if st.RemoteDefaultOnApplied {
+			return errSkipPersist
+		}
+		flipped = !st.RemoteAccess
+		st.RemoteAccess = true
+		st.RemoteDefaultOnApplied = true
+		return nil
+	})
+	if errors.Is(err, errSkipPersist) {
+		return false, nil
+	}
+	return flipped, err
 }
 
 func decodeRvSecret(b64 string) ([]byte, error) {
