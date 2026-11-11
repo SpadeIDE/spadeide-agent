@@ -38,6 +38,18 @@ type PathParams struct {
 	Path string `json:"path"`
 }
 
+// ArchiveParams compresses a file or folder on the host.
+// Format is "zip" or "tar.gz".
+type ArchiveParams struct {
+	Path   string `json:"path"`
+	Format string `json:"format"`
+}
+
+// PathResult is the absolute path of a created folder or archive.
+type PathResult struct {
+	Path string `json:"path"`
+}
+
 type WorkspaceRoot struct {
 	Path  string `json:"path"`
 	Label string `json:"label"`

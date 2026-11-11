@@ -123,3 +123,21 @@ func (c *client) fsUnwatch(env protocol.Envelope) {
 	}
 	c.ack(env.ID, c.filesystem().Unwatch(p.WatchID), protocol.CodeNotFound)
 }
+
+func (c *client) fsExtract(env protocol.Envelope) {
+	p, ok := decodeParams[protocol.PathParams](c, env)
+	if !ok {
+		return
+	}
+	path, err := c.filesystem().Extract(nil, p.Path)
+	c.reply(env.ID, protocol.PathResult{Path: path}, err)
+}
+
+func (c *client) fsArchive(env protocol.Envelope) {
+	p, ok := decodeParams[protocol.ArchiveParams](c, env)
+	if !ok {
+		return
+	}
+	path, err := c.filesystem().Archive(nil, p.Path, p.Format)
+	c.reply(env.ID, protocol.PathResult{Path: path}, err)
+}

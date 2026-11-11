@@ -31,6 +31,8 @@ var handlers = map[string]handlerFunc{
 	protocol.MethodFSGrep:           (*client).fsGrep,
 	protocol.MethodFSReplaceInFiles: (*client).fsReplaceInFiles,
 	protocol.MethodFSUnwatch:        (*client).fsUnwatch,
+	protocol.MethodFSExtract:        (*client).fsExtract,
+	protocol.MethodFSArchive:        (*client).fsArchive,
 	protocol.MethodGitStatus:        (*client).gitStatus,
 	protocol.MethodGitStage:         (*client).gitStageUnstageDiscard,
 	protocol.MethodGitUnstage:       (*client).gitStageUnstageDiscard,

@@ -64,6 +64,8 @@ func TestHandlersMalformedParams(t *testing.T) {
 		protocol.MethodFSGrep,
 		protocol.MethodFSReplaceInFiles,
 		protocol.MethodFSUnwatch,
+		protocol.MethodFSExtract,
+		protocol.MethodFSArchive,
 		protocol.MethodGitStage,
 		protocol.MethodGitUnstage,
 		protocol.MethodGitDiscard,

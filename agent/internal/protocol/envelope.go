@@ -49,6 +49,8 @@ const (
 	MethodFSSearch         = "fs.search"
 	MethodFSGrep           = "fs.grep"
 	MethodFSReplaceInFiles = "fs.replaceInFiles"
+	MethodFSExtract        = "fs.extract"
+	MethodFSArchive        = "fs.archive"
 	MethodGitStatus        = "git.status"
 	MethodGitStage         = "git.stage"
 	MethodGitUnstage       = "git.unstage"
@@ -76,6 +78,7 @@ var AllMethods = []string{
 	MethodFSList, MethodFSRead, MethodFSWrite, MethodFSMkdir, MethodFSDelete,
 	MethodFSRename, MethodFSCopy, MethodFSMove, MethodFSStat,
 	MethodFSWatch, MethodFSUnwatch, MethodFSSearch, MethodFSGrep, MethodFSReplaceInFiles,
+	MethodFSExtract, MethodFSArchive,
 	MethodGitStatus, MethodGitStage, MethodGitUnstage, MethodGitDiscard,
 	MethodGitCommit, MethodGitPush, MethodGitPull, MethodGitDiff,
 	MethodGitBranches, MethodGitCheckout, MethodGitApplyHunk,

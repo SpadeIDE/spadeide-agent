@@ -130,6 +130,10 @@ func (s *Service) Close() {
 		s.grepCancel()
 		s.grepCancel = nil
 	}
+	if s.archiveCancel != nil {
+		s.archiveCancel()
+		s.archiveCancel = nil
+	}
 	s.mu.Unlock()
 	s.ClearWatches()
 }

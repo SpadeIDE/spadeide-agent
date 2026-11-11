@@ -63,6 +63,8 @@ type Service struct {
 	// grepCancel aborts an in-flight walk when the client drops or starts
 	// another search — otherwise reconnect storms pile WalkDirs on a huge tree.
 	grepCancel context.CancelFunc
+	// archiveCancel aborts an in-flight extract/compress (host zip/tar).
+	archiveCancel context.CancelFunc
 }
 
 func New(home string, onEvent func(protocol.Envelope)) *Service {
